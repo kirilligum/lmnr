@@ -347,13 +347,13 @@ mod tests {
             isolated.query("CREATE TABLE trace_tags AS default.trace_tags").execute().await?;
             isolated.query("CREATE TABLE spans AS default.spans").execute().await?;
             isolated.query("CREATE TABLE evaluation_datapoints AS default.evaluation_datapoints").execute().await?;
-            let migration = include_str!("../../../frontend/lib/clickhouse/migrations/84_span_accounting.sql");
+            let migration = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../frontend/lib/clickhouse/migrations/84_span_accounting.sql"))?;
             let migration = migration.replace("default.", &format!("{database}."))
                 .replace("'clusters_dict'", "'default.clusters_dict'");
             for statement in migration.split(";\n").filter(|statement| !statement.trim().is_empty()) {
                 isolated.query(statement).execute().await?;
             }
-            let migration = include_str!("../../../frontend/lib/clickhouse/migrations/85_canonical_spans.sql");
+            let migration = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../frontend/lib/clickhouse/migrations/85_canonical_spans.sql"))?;
             let mut migration = migration.replace("default.", &format!("{database}."));
             for dictionary in ["clusters_dict", "unique_content_dict", "deduped_content_dict", "trace_access_policy_dict", "evaluations_dict"] {
                 migration = migration.replace(&format!("'{dictionary}'"), &format!("'default.{dictionary}'"));

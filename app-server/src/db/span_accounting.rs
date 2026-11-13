@@ -122,10 +122,13 @@ mod tests {
                 .await?;
             pool.execute("CREATE TABLE projects (id uuid PRIMARY KEY)")
                 .await?;
-            pool.execute(include_str!(
-                "../../../frontend/lib/db/migrations/0129_span_accounting_receipts.sql"
-            ))
-            .await?;
+            let migration = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../frontend/lib/db/migrations/0129_span_accounting_receipts.sql"
+            ))?;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(migration))
+                .execute(&pool)
+                .await?;
             for project_id in [Uuid::from_u128(1), Uuid::from_u128(9)] {
                 sqlx::query("INSERT INTO projects (id) VALUES ($1)")
                     .bind(project_id)

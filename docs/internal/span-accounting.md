@@ -162,7 +162,9 @@ Debugger-store tests cover the actual row loading and new-run/span flow.
 The unit tests exercise the accounting keys and real processor projection.
 `ch::traces_agg::tests::span_accounting_rowbinary_replay` is an explicit ignored
 integration test using the registered `CLICKHOUSE_URL`, `CLICKHOUSE_USER` and
-`CLICKHOUSE_PASSWORD`. It creates and removes a uniquely named database, clones
+`CLICKHOUSE_PASSWORD`. The opt-in database tests read migration files from the
+full repository at runtime; ordinary app-server-only Docker test builds do not
+need the frontend source. It creates and removes a uniquely named database, clones
 the existing table schemas, applies migrations 84 and 85, and verifies a replayed
 real Rust insert plus both native trace views with eight-hour continuations and
 late static fields. It also verifies canonical native span counts before and
