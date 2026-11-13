@@ -44,7 +44,9 @@ pub struct ToolDedup {
 /// known shapes in priority order. Each shape is validated on a borrowed peek
 /// and only then removed, so a malformed value survives into
 /// `CHSpan.attributes` for the frontend's attribute-based fallback renderer.
-fn extract_tool_definitions(attrs: &mut HashMap<String, Value>) -> Option<Vec<Value>> {
+pub(in crate::traces) fn extract_tool_definitions(
+    attrs: &mut HashMap<String, Value>,
+) -> Option<Vec<Value>> {
     if let Some(Value::Array(arr)) = attrs.get("ai.prompt.tools")
         && !arr.is_empty()
         && let Some(Value::Array(arr)) = attrs.remove("ai.prompt.tools")

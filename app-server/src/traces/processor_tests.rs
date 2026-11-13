@@ -39,6 +39,7 @@ use crate::{
     pubsub::{PubSub, PubSubTrait, in_memory::InMemoryPubSub},
     quickwit::{SPANS_INDEXER_EXCHANGE, SPANS_INDEXER_ROUTING_KEY},
     traces::{
+        accounting::test_store::MemoryAccountingStore,
         dedup::{
             content_hash,
             messages::{MessageDedup, build_message_dedup},
@@ -64,11 +65,24 @@ type Inserts = Vec<(String, Vec<Value>)>;
 #[derive(Clone, Default)]
 struct RecordingClickhouse {
     inserts: Arc<Mutex<Inserts>>,
+    fail_once: Arc<Mutex<Option<InsertFailure>>>,
+}
+
+struct InsertFailure {
+    table: &'static str,
+    after_persist: bool,
 }
 
 impl RecordingClickhouse {
     fn take(&self) -> Inserts {
         std::mem::take(&mut *self.inserts.lock().unwrap())
+    }
+
+    fn fail_once(&self, table: &'static str, after_persist: bool) {
+        *self.fail_once.lock().unwrap() = Some(InsertFailure {
+            table,
+            after_persist,
+        });
     }
 }
 
@@ -84,13 +98,34 @@ impl ClickhouseTrait for RecordingClickhouse {
         let batch = serde_json::to_value(T::to_data_plane_batch(items.to_vec()))?;
         let table = batch["table"].as_str().unwrap().to_string();
         let rows = batch["data"].as_array().cloned().unwrap_or_default();
+        let failure = {
+            let mut pending = self.fail_once.lock().unwrap();
+            if pending
+                .as_ref()
+                .is_some_and(|failure| failure.table == table)
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if failure
+            .as_ref()
+            .is_some_and(|failure| !failure.after_persist)
+        {
+            anyhow::bail!("synthetic {table} insert failure before persistence");
+        }
         self.inserts.lock().unwrap().push((table, rows));
+        if failure.is_some() {
+            anyhow::bail!("synthetic acknowledgement lost after persistence");
+        }
         Ok(())
     }
 }
 
 struct Harness {
     db: Arc<DB>,
+    accounting: MemoryAccountingStore,
     cache: Arc<Cache>,
     queue: Arc<MessageQueue>,
     pubsub: Arc<PubSub>,
@@ -132,6 +167,7 @@ impl Harness {
 
         Self {
             db,
+            accounting: MemoryAccountingStore::default(),
             cache,
             queue,
             pubsub,
@@ -200,10 +236,14 @@ impl Harness {
         }
     }
 
-    async fn flush(&mut self, messages: Vec<RabbitMqSpanMessage>) -> Flush {
+    async fn process(
+        &self,
+        messages: Vec<RabbitMqSpanMessage>,
+    ) -> Result<(), crate::worker::HandlerError> {
         process_span_messages(
             messages,
             self.db.clone(),
+            &self.accounting,
             clickhouse::Client::default(),
             self.cache.clone(),
             self.queue.clone(),
@@ -215,7 +255,10 @@ impl Harness {
             true,
         )
         .await
-        .expect("flush succeeds");
+    }
+
+    async fn flush(&mut self, messages: Vec<RabbitMqSpanMessage>) -> Flush {
+        self.process(messages).await.expect("flush succeeds");
         // Pubsub delivery hops through an unbounded channel to the subscriber.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -634,6 +677,193 @@ fn u16s(v: &Value) -> Vec<u16> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn changed_content_cannot_replace_an_accepted_operation() {
+    let mut h = Harness::new().await;
+    h.seed_project(id(P_OFF), PiiMode::Off).await;
+    let span = flush_one_spans()
+        .into_iter()
+        .find(|span| span.span_id == id(S2))
+        .unwrap();
+    let first = h.produce(span.clone()).await;
+    h.flush(vec![first]).await;
+
+    // A producer replay after successful storage has no trace-new markers or
+    // payload bytes, but still names the same complete message sequence.
+    let replay = h.produce(span.clone()).await;
+    assert!(
+        replay
+            .input_dedup
+            .as_ref()
+            .unwrap()
+            .trace_new_indices
+            .is_empty()
+    );
+    assert!(replay.input_dedup.as_ref().unwrap().contents.is_empty());
+    assert_eq!(h.flush(vec![replay]).await.rows("spans").len(), 1);
+
+    let mut changed = span;
+    changed.output = Some(json!([msg(
+        "assistant",
+        "A different answer under the same operation ID."
+    )]));
+    let conflict = h.produce(changed).await;
+    let result = h.flush(vec![conflict]).await;
+    assert!(
+        result.rows("spans").is_empty(),
+        "a conflicting answer must not reach canonical span storage"
+    );
+    assert!(result.rows("unique_content").is_empty());
+    assert!(result.rows("traces_agg").is_empty());
+    assert!(
+        h.accounting
+            .receipts
+            .lock()
+            .unwrap()
+            .values()
+            .all(|receipt| receipt.conflict_detected)
+    );
+}
+
+#[tokio::test]
+async fn receipt_ack_loss_precedes_analytical_writes_and_retry_repairs_them() {
+    let mut h = Harness::new().await;
+    h.seed_project(id(P_OFF), PiiMode::Off).await;
+    let span = flush_one_spans()
+        .into_iter()
+        .find(|span| span.span_id == id(S2))
+        .unwrap();
+    let message = h.produce(span).await;
+    *h.accounting.fail_after_accept.lock().unwrap() = true;
+    let error = h.process(vec![message.clone()]).await.unwrap_err();
+    assert!(error.should_requeue());
+    assert!(
+        h.ch.take().is_empty(),
+        "no analytical writes before receipt acceptance"
+    );
+    assert!(h.realtime.lock().unwrap().is_empty());
+    assert_eq!(h.accounting.receipts.lock().unwrap().len(), 1);
+    let retry = h.flush(vec![message]).await;
+    assert_eq!(retry.span_row(id(S2))["total_tokens"], 120);
+    assert!(!retry.rows("traces_static").is_empty());
+    assert_eq!(*h.accounting.writes.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn conflicting_usage_is_excluded_from_all_span_writes_without_losing_valid_work() {
+    let mut h = Harness::new().await;
+    h.seed_project(id(P_OFF), PiiMode::Off).await;
+    let span = flush_one_spans()
+        .into_iter()
+        .find(|span| span.span_id == id(S2))
+        .unwrap();
+    let message = h.produce(span).await;
+    h.flush(vec![message.clone()]).await;
+    let mut conflict = message.clone();
+    conflict
+        .span
+        .attributes
+        .raw_attributes
+        .insert("gen_ai.usage.input_tokens".into(), json!(999));
+    let valid = h.produce(flush_two_span()).await;
+    let result = h.flush(vec![conflict, valid]).await;
+    let rows = result.rows("spans");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(uuid_of(&rows[0]["span_id"]), id(S3));
+    assert!(result.rows("traces_agg").iter().all(|row| {
+        !row["span_accounting"]
+            .as_object()
+            .unwrap()
+            .contains_key(&id(S2).to_string())
+    }));
+    assert!(
+        result
+            .quickwit_docs("spans")
+            .iter()
+            .all(|row| row["span_id"] != id(S2).to_string())
+    );
+    assert!(
+        h.accounting
+            .receipts
+            .lock()
+            .unwrap()
+            .values()
+            .any(|receipt| receipt.identity.span_id == id(S2) && receipt.conflict_detected)
+    );
+    let replay = h.flush(vec![message]).await;
+    assert_eq!(replay.span_row(id(S2))["total_tokens"], 120);
+}
+
+#[tokio::test]
+async fn partial_writes_requeue_without_publishing_uncommitted_traces() {
+    for table in ["traces_agg", "traces_static", "unique_content", "spans"] {
+        for after_persist in [false, true] {
+            let mut h = Harness::new().await;
+            h.seed_project(id(P_OFF), PiiMode::Off).await;
+            let mut messages = Vec::new();
+            for span in flush_one_spans()
+                .into_iter()
+                .filter(|span| span.project_id == id(P_OFF))
+            {
+                messages.push(h.produce(span).await);
+            }
+            h.ch.fail_once(table, after_persist);
+            let error = h
+                .process(messages.clone())
+                .await
+                .expect_err("insert failure must reach the queue worker");
+            assert!(error.should_requeue(), "{table}: {error}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                h.realtime.lock().unwrap().is_empty(),
+                "{table}: failed flush must not announce durable state"
+            );
+
+            let first = h.ch.take();
+            let retry = h.flush(messages).await;
+            assert!(
+                !retry.rows("traces_static").is_empty(),
+                "{table}: retry must restore trace fields"
+            );
+            assert!(
+                !retry.rows("spans").is_empty(),
+                "{table}: retry must restore operation bodies"
+            );
+            assert!(
+                !retry
+                    .realtime_events(&format!("sse:{}:traces", id(P_OFF)), "trace_update")
+                    .is_empty()
+            );
+
+            // Every persisted delivery carries the same fact for an operation,
+            // including the non-recordable LLM call. A lost insert ACK must not
+            // change the logical total when those facts are reduced by identity.
+            let mut facts = BTreeMap::new();
+            for (_, rows) in first
+                .iter()
+                .chain(&retry.inserts)
+                .filter(|(name, _)| name == "traces_agg")
+            {
+                for row in rows {
+                    for (span_id, fact) in row["span_accounting"].as_object().unwrap() {
+                        if let Some(prior) = facts.insert(span_id.clone(), fact.clone()) {
+                            assert_eq!(prior, *fact, "{table}: a retry changed an accounting fact");
+                        }
+                    }
+                }
+            }
+            assert_eq!(facts.len(), 4);
+            assert_eq!(
+                facts
+                    .values()
+                    .map(|fact| fact["total_tokens"].as_i64().unwrap())
+                    .sum::<i64>(),
+                135
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn pipeline_end_to_end() {
     let mut h = Harness::new().await;
     h.seed_project(id(P_OFF), PiiMode::Off).await;
@@ -839,11 +1069,27 @@ async fn pipeline_end_to_end() {
     let has_spans = |r: &&&Value| !r["span_names"].as_array().unwrap().is_empty();
     let t1 = t1_partials.iter().find(has_spans).unwrap();
     assert_eq!(
-        t1["num_spans"], 4,
+        t1["span_accounting"].as_object().unwrap().len(),
+        4,
         "S1, S2, S7, S8 — metadata-only spans excluded"
     );
-    assert_eq!(t1["input_tokens"], 110);
-    assert_eq!(t1["output_tokens"], 25);
+    assert_eq!(t1["input_tokens"], 0);
+    assert_eq!(t1["output_tokens"], 0);
+    let accounting = t1["span_accounting"].as_object().unwrap();
+    assert_eq!(
+        accounting
+            .values()
+            .map(|fact| fact["input_tokens"].as_i64().unwrap())
+            .sum::<i64>(),
+        110
+    );
+    assert_eq!(
+        accounting
+            .values()
+            .map(|fact| fact["output_tokens"].as_i64().unwrap())
+            .sum::<i64>(),
+        25
+    );
     assert_eq!(t1["start_time"], nanos(10));
     assert_eq!(t1["end_time"], nanos(40));
     assert_eq!(t1["metadata"], json!([["team", "\"core\""]]));

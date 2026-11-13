@@ -158,8 +158,8 @@ export type TraceRow = {
 
 // Wire shape of one trace in a `trace_update` SSE event — mirrors the Rust
 // `RealtimeTrace` (app-server/src/traces/realtime.rs), camelCase serde. Numbers
-// are per-batch deltas the frontend accumulates. Keep in sync with
-// `realtimeTraceToRow` / `mergeTraceDelta` / `tracesSelectColumns`.
+// are per-batch deltas for wire compatibility. Frontend consumers treat the
+// event as an invalidation and read authoritative cumulative rows.
 export type RealtimeTracePayload = {
   id: string;
   startTime: string | null;

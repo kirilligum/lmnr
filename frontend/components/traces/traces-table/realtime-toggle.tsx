@@ -4,7 +4,7 @@ import { Switch } from "@/components/ui/switch";
 import { useLocalStorage } from "@/hooks/use-local-storage.tsx";
 
 export function TracesRealtimeToggle() {
-  const [realtimeEnabled, setRealtimeEnabled] = useLocalStorage("traces-table:realtime", false);
+  const [realtimeEnabled, setRealtimeEnabled] = useLocalStorage("traces-table:realtime", true);
 
   return (
     <div className="flex items-center gap-2 px-2 border rounded-md bg-background h-7">

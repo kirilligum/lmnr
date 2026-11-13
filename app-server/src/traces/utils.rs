@@ -4,6 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use indexmap::IndexMap;
 use regex::Regex;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::opentelemetry_proto::opentelemetry_proto_common_v1;
@@ -45,7 +46,7 @@ pub async fn get_llm_usage_for_span(
     db: Arc<DB>,
     cache: Arc<Cache>,
     project_id: &Uuid,
-) -> SpanUsage {
+) -> anyhow::Result<SpanUsage> {
     let input_tokens = attributes.input_tokens();
     let output_tokens = attributes.output_tokens();
     let total_tokens = input_tokens.total() + output_tokens;
@@ -69,11 +70,8 @@ pub async fn get_llm_usage_for_span(
     // Transform the model name and provider names for universal model pricing lookup
     (model_name, provider_name) = tranform_model_and_provider(model_name, provider_name);
 
-    if input_cost.is_some_and(|c| c > 0.0)
-        || output_cost.is_some_and(|c| c > 0.0)
-        || total_cost.is_some_and(|c| c > 0.0)
-    {
-        return SpanUsage {
+    if input_cost.is_some() || output_cost.is_some() || total_cost.is_some() {
+        return Ok(SpanUsage {
             input_tokens: input_tokens.total(),
             output_tokens,
             total_tokens,
@@ -87,15 +85,18 @@ pub async fn get_llm_usage_for_span(
             response_model: response_model.clone(),
             request_model: request_model.clone(),
             provider_name,
-        };
+            pricing_basis: json!({"kind": "supplied"}),
+        });
     }
 
     let mut input_cost = input_cost.unwrap_or(0.0);
     let mut output_cost = output_cost.unwrap_or(0.0);
     let mut total_cost = total_cost.unwrap_or(input_cost + output_cost);
+    let mut pricing_basis = json!({"kind": "unpriced", "reason": "missing_model"});
 
     if let Some(model) = model_name.as_deref() {
         let model_info = ModelInfo::extract(model, provider_name.as_deref());
+        pricing_basis = json!({"kind": "unpriced", "reason": "missing_rate_card"});
 
         if let Some(model_costs) = get_model_costs_for_project(
             db.clone(),
@@ -105,7 +106,7 @@ pub async fn get_llm_usage_for_span(
             orig_provider_name.as_deref().unwrap_or(""),
             orig_model_name.as_deref().unwrap_or(""),
         )
-        .await
+        .await?
         {
             let span_cost_input: SpanCostInput =
                 build_span_cost_input(attributes, &input_tokens, output_tokens);
@@ -113,6 +114,8 @@ pub async fn get_llm_usage_for_span(
             input_cost = cost_entry.input_cost;
             output_cost = cost_entry.output_cost;
             total_cost = input_cost + output_cost;
+            pricing_basis =
+                json!({"kind": "calculated", "rates": model_costs.0, "input": span_cost_input});
         }
     } else if let Some(provider) = provider_name.as_deref() {
         // Span has a provider but no model name.
@@ -124,7 +127,7 @@ pub async fn get_llm_usage_for_span(
         }
     }
 
-    SpanUsage {
+    Ok(SpanUsage {
         input_tokens: input_tokens.total(),
         output_tokens,
         total_tokens,
@@ -137,7 +140,32 @@ pub async fn get_llm_usage_for_span(
         response_model,
         request_model,
         provider_name,
-    }
+        pricing_basis,
+    })
+}
+
+/// Hash normalized source billing inputs, before accepted usage overwrites them.
+/// Content and processing-time prices are deliberately outside this identity.
+pub(super) fn accounting_fingerprint(span: &mut Span) -> Vec<u8> {
+    let source = if span.is_llm_span() {
+        let attributes = &mut span.attributes;
+        let input_tokens = attributes.input_tokens();
+        let output_tokens = attributes.output_tokens();
+        json!({
+            "version": 1,
+            "llm": true,
+            "request_model": attributes.request_model(),
+            "response_model": attributes.response_model(),
+            "provider": attributes.provider_name(),
+            "input_cost": attributes.input_cost(),
+            "output_cost": attributes.output_cost(),
+            "total_cost": attributes.total_cost(),
+            "tokens": build_span_cost_input(attributes, &input_tokens, output_tokens),
+        })
+    } else {
+        json!({"version": 1, "llm": false})
+    };
+    Sha256::digest(source.to_string().as_bytes()).to_vec()
 }
 
 /// Build SpanCostInput from span attributes

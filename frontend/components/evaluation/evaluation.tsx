@@ -26,16 +26,11 @@ import {
   useEvalStore,
 } from "@/components/evaluation/store";
 import { useScoreDirections } from "@/components/evaluation/use-score-directions";
-import {
-  type EvaluationStatsPayload,
-  flattenScores,
-  mergeTrialUpsertIntoRows,
-  mergeTraceUpdateIntoRows,
-} from "@/components/evaluation/utils";
+import { type EvaluationStatsPayload, flattenScores } from "@/components/evaluation/utils";
 import { useInfiniteScroll } from "@/components/ui/infinite-datatable/hooks";
 import { useTableConfigStore, useTableView } from "@/components/ui/infinite-datatable/model/table-config-store";
 import { InfiniteDataTableProvider } from "@/components/ui/infinite-datatable/model/table-store";
-import { swrFetcher } from "@/lib/api/fetch-api";
+import { fetchApi, swrFetcher } from "@/lib/api/fetch-api";
 import { groupTrialsIntoTasks, isTaskGroupRow } from "@/lib/evaluation/task-groups";
 import {
   type EvalRow,
@@ -44,6 +39,7 @@ import {
   type LinkedDataset,
 } from "@/lib/evaluation/types";
 import { useRealtime } from "@/lib/hooks/use-realtime";
+import { toast } from "@/lib/hooks/use-toast";
 
 import TraceView from "../traces/trace-view";
 
@@ -142,7 +138,7 @@ function EvaluationContent({ evaluations, evaluationId, datasets }: EvaluationPr
   const columnSqls = useMemo(() => columnDefs.map((c) => c.meta?.sql).filter(Boolean), [columnDefs]);
 
   const fetchTrials = useCallback(
-    async (pageNumber: number) => {
+    async (pageNumber: number, signal?: AbortSignal) => {
       const urlParams = buildFetchParams(
         {
           search,
@@ -156,9 +152,12 @@ function EvaluationContent({ evaluations, evaluationId, datasets }: EvaluationPr
         columnDefs
       );
       const url = `/api/projects/${params.projectId}/evaluations/${evaluationId}?${urlParams.toString()}`;
-      const response = await fetch(url);
-      if (!response.ok) throw new Error("Failed to fetch trials.");
-      const data: EvaluationResultsInfo = await response.json();
+      const { data, error } = await fetchApi<EvaluationResultsInfo>(url, { signal });
+      if (error !== null) {
+        toast({ title: "Failed to load trials", description: error, variant: "destructive" });
+        throw new Error(error);
+      }
+
       return { items: data.results, count: 0 };
     },
     [search, filter, params.projectId, evaluationId, sortBy, sortDirection, targetId, columnDefs]
@@ -170,7 +169,7 @@ function EvaluationContent({ evaluations, evaluationId, datasets }: EvaluationPr
     isFetching,
     isLoading: isLoadingTrials,
     fetchNextPage,
-    updateData,
+    refresh,
   } = useInfiniteScroll<EvalRow>({
     fetchFn: fetchTrials,
     enabled: !isStatsLoading && !isViewLoading,
@@ -201,42 +200,30 @@ function EvaluationContent({ evaluations, evaluationId, datasets }: EvaluationPr
 
   // Realtime — only on the live (non-comparison) eval page.
   const debouncedRevalidateStats = useMemo(
-    () => debounce(() => mutateStats(), 1000, { leading: false, trailing: true }),
+    () => debounce(() => mutateStats(), 1000, { leading: false, trailing: true, maxWait: 1000 }),
     [mutateStats]
   );
   useEffect(() => () => debouncedRevalidateStats.cancel(), [debouncedRevalidateStats]);
 
+  const reconcile = useCallback(() => {
+    refresh();
+    debouncedRevalidateStats();
+  }, [refresh, debouncedRevalidateStats]);
   const realtimeHandlers = useMemo(
     () => ({
       datapoint_upsert: (event: MessageEvent) => {
-        if (targetId) return;
         try {
-          const payload = JSON.parse(event.data) as { datapoints?: Array<EvalRow & { id: string }> };
-          payload.datapoints?.forEach((incoming) => {
-            const flattened = flattenScores(incoming["scores"]);
-            updateData((rows) => mergeTrialUpsertIntoRows(rows, incoming, flattened));
-            // Stats also carry the running-Trial count, so any upsert can change them.
-            debouncedRevalidateStats();
-            Object.keys(flattened).forEach((key) => addScoreName(key.slice("score:".length)));
-          });
-        } catch (e) {
-          console.warn("Failed to parse realtime datapoint_upsert:", e);
+          const payload = JSON.parse(event.data) as { datapoints?: EvalRow[] };
+          for (const incoming of payload.datapoints ?? []) {
+            Object.keys(flattenScores(incoming["scores"])).forEach((key) => addScoreName(key.slice("score:".length)));
+          }
+        } finally {
+          reconcile();
         }
       },
-      trace_update: (event: MessageEvent) => {
-        if (targetId) return;
-        try {
-          const payload = JSON.parse(event.data) as {
-            traces?: Array<Record<string, unknown> & { id: string }>;
-          };
-          payload.traces?.forEach((trace) => updateData((rows) => mergeTraceUpdateIntoRows(rows, trace)));
-          debouncedRevalidateStats();
-        } catch (e) {
-          console.warn("Failed to parse realtime trace_update:", e);
-        }
-      },
+      trace_update: reconcile,
     }),
-    [updateData, addScoreName, debouncedRevalidateStats, targetId]
+    [reconcile, addScoreName]
   );
 
   useRealtime({
@@ -244,6 +231,7 @@ function EvaluationContent({ evaluations, evaluationId, datasets }: EvaluationPr
     projectId: params.projectId,
     enabled: !targetId,
     eventHandlers: realtimeHandlers,
+    onConnect: reconcile,
   });
 
   // Selection is DERIVED from the URL, not stored — so a deep link whose

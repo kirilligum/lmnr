@@ -20,6 +20,7 @@ pub mod projects;
 pub mod reports;
 pub mod signal_triggers;
 pub mod signals;
+pub(crate) mod span_accounting;
 pub mod slack_integrations;
 pub mod spans;
 pub mod trace;

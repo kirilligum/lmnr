@@ -296,7 +296,7 @@ pub async fn get_trace_id_by_span_id(
     project_id: Uuid,
 ) -> Result<Option<Uuid>> {
     let row = clickhouse
-        .query("SELECT trace_id FROM spans WHERE span_id = ? AND project_id = ? LIMIT 1")
+        .query("SELECT trace_id FROM spans_canonical AS spans WHERE span_id = ? AND project_id = ? LIMIT 1")
         .bind(span_id)
         .bind(project_id)
         .fetch_optional::<TraceIdRow>()

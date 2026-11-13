@@ -54,7 +54,7 @@ pub async fn get_workspace_bytes_ingested_by_project_ids(
     let query = "WITH spans_bytes_ingested AS (
       SELECT
         SUM(spans.size_bytes) as spans_bytes_ingested
-      FROM spans
+      FROM spans_canonical AS spans
       WHERE project_id IN { project_ids: Array(UUID) }
       AND spans.start_time >= { latest_reset_time: DateTime(6) }
     ),

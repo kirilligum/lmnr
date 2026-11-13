@@ -19,6 +19,7 @@ import {
 } from "@/lib/actions/common/query-builder";
 import { type TracesStatsDataPoint } from "@/lib/actions/traces/stats-types";
 import { type TimeRange } from "@/lib/clickhouse/utils.ts";
+import { type TraceTimeField, traceTimeColumn } from "@/lib/traces/time-filter";
 
 /**
  * eq/ne filter for the stringified-JSON agent_input column. `eq` matches when
@@ -173,6 +174,7 @@ export interface BuildTracesQueryOptions {
   startTime?: string;
   endTime?: string;
   pastHours?: string;
+  timeField?: TraceTimeField;
   sortBy?: string;
   sortSql?: string;
   sortDirection?: "ASC" | "DESC";
@@ -265,7 +267,7 @@ export const buildTracesQueryWithParams = (options: BuildTracesQueryOptions): Qu
   if (sortBy && sortSql) {
     orderBy.push({ column: sortSql, direction: sortDirection ?? "DESC" });
   } else {
-    orderBy.push({ column: "start_time", direction: sortDirection ?? "DESC" });
+    orderBy.push({ column: traceTimeColumn(options.timeField), direction: sortDirection ?? "DESC" });
   }
 
   // Build filter config with custom column processors
@@ -280,7 +282,7 @@ export const buildTracesQueryWithParams = (options: BuildTracesQueryOptions): Qu
       startTime,
       endTime,
       pastHours,
-      timeColumn: "start_time",
+      timeColumn: traceTimeColumn(options.timeField),
     },
     filters,
     columnFilterConfig,
@@ -303,6 +305,7 @@ export interface BuildTracesCountQueryOptions {
   startTime?: string;
   endTime?: string;
   pastHours?: string;
+  timeField?: TraceTimeField;
   customColumns?: CustomColumn[];
 }
 
@@ -335,7 +338,7 @@ export const buildTracesCountQueryWithParams = (options: BuildTracesCountQueryOp
       startTime,
       endTime,
       pastHours,
-      timeColumn: "start_time",
+      timeColumn: traceTimeColumn(options.timeField),
     },
     filters,
     columnFilterConfig: buildFilterConfigWithCustomColumns(customColumns),
@@ -353,6 +356,8 @@ export interface BuildTracesIdsQueryOptions {
   startTime?: string;
   endTime?: string;
   pastHours?: string;
+  timeField?: TraceTimeField;
+  customColumns?: CustomColumn[];
 }
 
 export const buildTracesIdsQueryWithParams = (options: BuildTracesIdsQueryOptions): QueryResult => {
@@ -384,13 +389,13 @@ export const buildTracesIdsQueryWithParams = (options: BuildTracesIdsQueryOption
       startTime,
       endTime,
       pastHours,
-      timeColumn: "start_time",
+      timeColumn: traceTimeColumn(options.timeField),
     },
     filters,
-    columnFilterConfig: tracesColumnFilterConfig,
+    columnFilterConfig: buildFilterConfigWithCustomColumns(options.customColumns),
     orderBy: [
       {
-        column: "start_time",
+        column: traceTimeColumn(options.timeField),
         direction: "DESC",
       },
     ],

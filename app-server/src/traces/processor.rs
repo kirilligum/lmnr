@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use anyhow::Context;
 use itertools::Itertools;
 use rayon::prelude::*;
 use serde_json::Value;
@@ -36,6 +37,7 @@ use crate::{
         producer::publish_for_indexing,
     },
     traces::{
+        accounting::{AccountedMessage, AccountingStore, account_span_messages},
         dedup::{
             SeenMarks, SharedContentBatch,
             messages::{MessageBatch, MessageDedup},
@@ -49,7 +51,7 @@ use crate::{
         },
         span_attributes::{SPAN_TRACE_INPUT, SPAN_TRACE_OUTPUT_HASHES},
         spans::SpanUsage,
-        utils::{get_llm_usage_for_span, prepare_span_for_recording},
+        utils::prepare_span_for_recording,
     },
     utils::limits::update_workspace_bytes_ingested,
     worker::HandlerError,
@@ -232,6 +234,7 @@ fn collect_static_agent_io_rows(
 #[instrument(skip(
     messages,
     db,
+    accounting,
     clickhouse,
     cache,
     queue,
@@ -244,6 +247,7 @@ fn collect_static_agent_io_rows(
 pub async fn process_span_messages(
     messages: Vec<RabbitMqSpanMessage>,
     db: Arc<DB>,
+    accounting: &impl AccountingStore,
     clickhouse: clickhouse::Client,
     cache: Arc<Cache>,
     queue: Arc<MessageQueue>,
@@ -255,14 +259,15 @@ pub async fn process_span_messages(
     quickwit_indexing_enabled: bool,
 ) -> Result<(), HandlerError> {
     let messages = enrich_attributes(messages);
-    let (metadata_only, mut messages): (Vec<RabbitMqSpanMessage>, Vec<RabbitMqSpanMessage>) =
-        messages
-            .into_iter()
-            .partition(|m| m.span.attributes.is_metadata_only());
+    let (metadata_only, messages): (Vec<RabbitMqSpanMessage>, Vec<RabbitMqSpanMessage>) = messages
+        .into_iter()
+        .partition(|m| m.span.attributes.is_metadata_only());
     let MetadataOnlySpans {
         raw_trace_io,
         metadata_patches,
     } = classify_metadata_only_spans(&metadata_only);
+
+    let mut messages = account_span_messages(messages, &db, &cache, accounting).await?;
 
     // Hybrid traces live in the data plane; agent versioning reads the cloud.
     let agent_prompts: Vec<CHAgentPrompt> = messages
@@ -270,13 +275,13 @@ pub async fn process_span_messages(
         .filter(|_| config.is_none())
         .filter_map(|m| {
             Some(agent_versioning::ingest::row(
-                &m.span,
-                m.agent_prompt.take()?,
+                &m.message.span,
+                m.message.agent_prompt.take()?,
             ))
         })
         .collect();
 
-    let mut batch = enrich_spans_with_usage(messages, &db, &cache).await;
+    let mut batch = prepare_span_batch(messages);
     let mut trace_aggregations = TraceAggregation::from_spans(&batch.spans, &batch.usages);
     agent_versioning::ingest::tag_releases(&db, &cache, &agent_prompts, &mut trace_aggregations)
         .await;
@@ -327,22 +332,15 @@ pub async fn process_span_messages(
         .collect();
     let seen_marks = collect_seen_marks(&dedup, &recordable_refs, &pii_outcome);
 
-    // The trace tables run in parallel with the span path; the span path
-    // itself is strictly ordered (see `write_span_tables`).
-    let trace_branch = async {
-        if !trace_aggregations.is_empty() {
-            debugger_session_blocks::upsert_blocks_for_traces(&db.pool, &trace_aggregations).await;
-            dispatch_trace_realtime_updates(&trace_aggregations, cache.clone(), &pubsub).await;
-        }
-        write_trace_tables(
-            &ch,
-            config,
-            &trace_aggregations,
-            &metadata_patches,
-            &raw_trace_io,
-        )
-        .await;
-    };
+    // Await both branches even if one fails: retries must repair partial writes,
+    // and readers must not be notified before either branch is durable.
+    let trace_branch = write_trace_tables(
+        &ch,
+        config,
+        &trace_aggregations,
+        &metadata_patches,
+        &raw_trace_io,
+    );
     let span_branch = write_span_tables(
         &ch,
         config,
@@ -351,8 +349,14 @@ pub async fn process_span_messages(
         &seen_marks,
         &cache,
     );
-    let ((), span_result) = tokio::join!(trace_branch, span_branch);
+    let (trace_result, span_result) = tokio::join!(trace_branch, span_branch);
+    trace_result?;
     span_result?;
+
+    if !trace_aggregations.is_empty() {
+        debugger_session_blocks::upsert_blocks_for_traces(&db.pool, &trace_aggregations).await;
+        dispatch_trace_realtime_updates(&trace_aggregations, cache.clone(), &pubsub).await;
+    }
 
     if let Err(e) = insert_agent_prompts(&clickhouse, &agent_prompts).await {
         log::error!(
@@ -492,6 +496,7 @@ fn parse_metadata_patch(span: &Span) -> Option<TraceMetadataPatch> {
     };
     match serde_json::to_value(&metadata) {
         Ok(metadata) => Some(TraceMetadataPatch {
+            span_id: span.span_id,
             trace_id: span.trace_id,
             project_id: span.project_id,
             metadata,
@@ -508,17 +513,9 @@ fn parse_metadata_patch(span: &Span) -> Option<TraceMetadataPatch> {
     }
 }
 
-/// Usage lookup + recording prep, then the wire messages split into aligned
-/// columns. Only LLM spans get token/cost usage: a non-LLM span may still carry
-/// stray `gen_ai.usage.*` attributes (some auto-instrumentations set them on
-/// Default/Tool spans), and counting those would inflate the per-span columns
-/// and trace totals (LAM-1873). Sizing is deferred to `charge_span_sizes` so
-/// the recorded size reflects PII redaction.
-async fn enrich_spans_with_usage(
-    messages: Vec<RabbitMqSpanMessage>,
-    db: &Arc<DB>,
-    cache: &Arc<Cache>,
-) -> SpanBatch {
+/// Apply accepted usage before splitting wire messages into aligned columns.
+/// Sizing follows PII redaction in `charge_span_sizes`.
+fn prepare_span_batch(messages: Vec<AccountedMessage>) -> SpanBatch {
     let mut batch = SpanBatch {
         spans: Vec::with_capacity(messages.len()),
         usages: Vec::with_capacity(messages.len()),
@@ -526,18 +523,11 @@ async fn enrich_spans_with_usage(
         output_dedups: Vec::with_capacity(messages.len()),
         tool_dedups: Vec::with_capacity(messages.len()),
     };
-    for mut m in messages {
-        let usage = if m.span.is_llm_span() {
-            get_llm_usage_for_span(
-                &mut m.span.attributes,
-                db.clone(),
-                cache.clone(),
-                &m.span.project_id,
-            )
-            .await
-        } else {
-            SpanUsage::default()
-        };
+    for AccountedMessage {
+        message: mut m,
+        usage,
+    } in messages
+    {
         prepare_span_for_recording(&mut m.span, &usage);
         if !m.pre_processed {
             convert_span_to_provider_format(&mut m.span);
@@ -846,20 +836,17 @@ async fn write_trace_tables(
     aggregations: &[TraceAggregation],
     metadata_patches: &[TraceMetadataPatch],
     raw_trace_io: &[RawTraceIo],
-) {
+) -> Result<(), HandlerError> {
     let now_ns = chrono_to_nanoseconds(chrono::Utc::now());
     let start_time_by_trace = resolve_static_start_times(aggregations);
 
     let agg_rows =
         build_traces_agg_rows(aggregations, metadata_patches, &start_time_by_trace, now_ns);
-    if !agg_rows.is_empty()
-        && let Err(e) = ch.insert_batch(&agg_rows, config).await
-    {
-        log::error!(
-            "Failed to insert {} trace aggregation partials to ClickHouse: {:?}",
-            agg_rows.len(),
-            e
-        );
+    if !agg_rows.is_empty() {
+        ch.insert_batch(&agg_rows, config)
+            .await
+            .context("Failed to persist trace aggregation partials")
+            .map_err(HandlerError::transient)?;
     }
 
     let static_rows = build_traces_static_rows(
@@ -869,15 +856,13 @@ async fn write_trace_tables(
         &start_time_by_trace,
         now_ns,
     );
-    if !static_rows.is_empty()
-        && let Err(e) = ch.insert_batch(&static_rows, config).await
-    {
-        log::error!(
-            "Failed to insert {} traces_static rows to ClickHouse: {:?}",
-            static_rows.len(),
-            e
-        );
+    if !static_rows.is_empty() {
+        ch.insert_batch(&static_rows, config)
+            .await
+            .context("Failed to persist trace static fields")
+            .map_err(HandlerError::transient)?;
     }
+    Ok(())
 }
 
 /// Aggregate partials from the in-memory per-batch deltas — never a cumulative
@@ -897,9 +882,7 @@ fn build_traces_agg_rows(
     );
     rows.extend(metadata_patches.iter().map(|patch| {
         CHTraceAgg::from_metadata_patch(
-            patch.project_id,
-            patch.trace_id,
-            Some(&patch.metadata),
+            patch,
             start_time_by_trace
                 .get(&(patch.project_id, patch.trace_id))
                 .copied()
@@ -1271,6 +1254,7 @@ mod tests {
             span_names: HashSet::new(),
             release: None,
             agent_versions: Vec::new(),
+            span_accounting: Default::default(),
         }
     }
 

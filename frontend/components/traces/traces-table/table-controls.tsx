@@ -6,6 +6,7 @@ import AdvancedSearch from "@/components/common/advanced-search";
 import TracesChart from "@/components/traces/traces-chart";
 import { RESOURCE } from "@/components/traces/traces-table/constants";
 import { TracesRealtimeToggle } from "@/components/traces/traces-table/realtime-toggle";
+import { TracesTimeFilter } from "@/components/traces/traces-table/time-filter";
 import TracesColumnsMenu from "@/components/traces/traces-table/traces-columns-menu";
 import { type buildColumnDefs } from "@/components/traces/traces-table/traces-table-store";
 import DateRangeFilter from "@/components/ui/date-range-filter";
@@ -50,6 +51,7 @@ export function TracesTableControls({
         <DataTableFilter columns={allFilters} filters={filters} onFiltersChange={onFiltersChange} />
         <TracesColumnsMenu columnLabels={columnLabels} columnDefs={columnDefs} />
         <ViewsToolbar projectId={projectId} resource={RESOURCE} />
+        <TracesTimeFilter />
         <DateRangeFilter />
         <RefreshButton onClick={onRefresh} variant="outline" />
         <TracesRealtimeToggle />

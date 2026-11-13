@@ -30,6 +30,7 @@ use crate::{
 /// `POST /v1/traces/metadata` endpoint via a virtual metadata-only span.
 #[derive(Debug, Clone)]
 pub struct TraceMetadataPatch {
+    pub span_id: Uuid,
     pub trace_id: Uuid,
     pub project_id: Uuid,
     pub metadata: Value,

@@ -116,7 +116,7 @@ export default function DebuggerSessionViewContent({ sessionId }: { sessionId: s
       trace_agent_input_update: (event: MessageEvent) => {
         const payload = JSON.parse(event.data) as { traceId?: string; agentInput?: unknown };
         if (!payload.traceId) return;
-        storeApi.getState().applyAgentInput(payload.traceId, payload.agentInput);
+        storeApi.getState().refreshTraceRows([payload.traceId]);
       },
       // Note / eval block pushed → upsert it into the timeline.
       block_update: (event: MessageEvent) => {
@@ -145,11 +145,23 @@ export default function DebuggerSessionViewContent({ sessionId }: { sessionId: s
     [storeApi, sessionId, projectId, router, toast, backfillPendingEvalScores]
   );
 
+  const reconcile = useCallback(() => {
+    const state = storeApi.getState();
+    void state.fetchSessionBlocks(sessionId);
+    state.refreshTraceRows([
+      ...new Set([...state.traces.map((trace) => trace.id), ...Object.keys(state.traceRowStates)]),
+    ]);
+    for (const trace of state.traces) {
+      if (state.expandedTraceIds.has(trace.id)) void state.fetchTraceSpans(trace);
+    }
+  }, [storeApi, sessionId]);
+
   useRealtime({
     key: `rollout_session_${sessionId}`,
     projectId: projectId as string,
     enabled: !!projectId,
     eventHandlers,
+    onConnect: reconcile,
   });
 
   return (

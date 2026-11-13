@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 use clickhouse::Row;
@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::traces::TraceAggregation;
+use super::traces::{SpanAccounting, TraceAggregation};
 use super::utils::chrono_to_nanoseconds;
 use super::{
     ClickhouseInsertable, DataPlaneBatch, SPANS_CH_ASYNC_INSERT_BUSY_TIMEOUT_MAX_MS, Table,
 };
 use crate::traces::input_extraction::metadata::USER_TASK_METADATA_KEY;
+use crate::traces::metadata::TraceMetadataPatch;
 
 /// Whether any partial exists for the trace. Existence probe on the
 /// `(project_id, id)` primary key: no GROUP BY (a trace is present iff it has at
@@ -127,6 +128,9 @@ pub struct CHTraceAgg {
     pub cluster_ids: Vec<Uuid>,
     /// Agent versions that ran in this trace; the set unions across partials.
     pub agent_versions: Vec<CHTraceAgentVersion>,
+    /// Separate from legacy additive counters: a retry carries the same keys
+    /// even when RabbitMQ changes batch order or boundaries.
+    pub span_accounting: BTreeMap<String, SpanAccounting>,
 }
 
 /// One element of `traces_agg.agent_versions`. Field order is the DDL tuple.
@@ -205,33 +209,33 @@ impl CHTraceAgg {
             project_id: agg.project_id,
             start_time,
             end_time,
-            input_tokens: agg.input_tokens,
-            output_tokens: agg.output_tokens,
-            total_tokens: agg.total_tokens,
-            input_cost: agg.input_cost,
-            output_cost: agg.output_cost,
-            total_cost: agg.total_cost,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            input_cost: 0.0,
+            output_cost: 0.0,
+            total_cost: 0.0,
             metadata: encode_metadata(agg.metadata.as_ref()),
             tags: agg.tags.iter().cloned().collect(),
-            num_spans: agg.num_spans as u64,
+            num_spans: 0,
             span_names: agg.span_names.iter().cloned().collect(),
-            cache_read_input_tokens: agg.cache_read_input_tokens as u64,
-            cache_creation_input_tokens: agg.cache_creation_input_tokens as u64,
-            reasoning_tokens: agg.reasoning_tokens as u64,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            reasoning_tokens: 0,
             statuses: status_enum_values(agg.status.as_deref()),
             trace_types: vec![trace_type_enum_value(agg.trace_type)],
             signal_events: Vec::new(),
             cluster_ids: Vec::new(),
             agent_versions: agg.agent_versions.clone(),
+            span_accounting: agg.span_accounting.clone(),
         }
     }
 
     /// Build a partial row for a metadata patch (`POST /v1/traces/metadata`)
     /// straight from the patch. Every aggregate is an identity except
     /// `metadata` (the patched object, unversioned — `maxMap`'s per-key value
-    /// comparison is arbitrary from an application standpoint, so this is
-    /// best-effort, not LWW) and `num_spans` (+1, paying for the virtual
-    /// metadata-only span that drove the patch).
+    /// comparison is arbitrary from an application standpoint) and one zero
+    /// usage fact identifying the virtual metadata-only span.
     ///
     /// `end_time` is `0`, the `max` identity: a patch learns nothing about the
     /// trace's end, and `max` can never be lowered back down once a too-late
@@ -246,15 +250,13 @@ impl CHTraceAgg {
     /// passes `now_ns + 1h`, which is still a `min` no-op against any real
     /// (past-or-present) start while staying in the same or an adjacent
     /// monthly partition so the merge stays local.
-    pub fn from_metadata_patch(
-        project_id: Uuid,
-        trace_id: Uuid,
-        metadata: Option<&Value>,
-        start_time: i64,
-    ) -> Self {
-        let mut row = Self::zero_sum_partial(project_id, trace_id, start_time);
-        row.metadata = encode_metadata(metadata);
-        row.num_spans = 1;
+    pub fn from_metadata_patch(patch: &TraceMetadataPatch, start_time: i64) -> Self {
+        let mut row = Self::zero_sum_partial(patch.project_id, patch.trace_id, start_time);
+        row.metadata = encode_metadata(Some(&patch.metadata));
+        row.span_accounting.insert(
+            patch.span_id.simple().to_string(),
+            SpanAccounting::default(),
+        );
         row
     }
 
@@ -287,6 +289,7 @@ impl CHTraceAgg {
             signal_events: Vec::new(),
             cluster_ids: Vec::new(),
             agent_versions: Vec::new(),
+            span_accounting: BTreeMap::new(),
         }
     }
 }
@@ -317,6 +320,151 @@ mod tests {
 
     use super::*;
 
+    /// Uses an isolated database and the real RowBinary writer. It cannot run
+    /// during ordinary unit tests or touch an existing application's tables.
+    #[tokio::test]
+    #[ignore = "requires CLICKHOUSE_URL/USER/PASSWORD and permission to create an ephemeral database"]
+    async fn span_accounting_rowbinary_replay() -> anyhow::Result<()> {
+        let client = clickhouse::Client::default()
+            .with_url(std::env::var(crate::env::clickhouse::URL)?)
+            .with_user(std::env::var(crate::env::clickhouse::USER)?)
+            .with_password(std::env::var(crate::env::clickhouse::PASSWORD)?)
+            // Match main.rs: the driver's header parser cannot parse the
+            // existing named signal-event tuples in this table.
+            .with_validation(false)
+            .with_setting("async_insert", "1")
+            .with_setting("wait_for_async_insert", "1")
+            .with_compression(clickhouse::Compression::None);
+        let database = format!("lmnr_accounting_test_{}", Uuid::new_v4().simple());
+        client
+            .query(&format!("CREATE DATABASE {database}"))
+            .execute()
+            .await?;
+        let isolated = client.clone().with_database(&database);
+        let result: anyhow::Result<()> = async {
+            isolated.query("CREATE TABLE traces_agg AS default.traces_agg").execute().await?;
+            isolated.query("CREATE TABLE traces_static AS default.traces_static").execute().await?;
+            isolated.query("CREATE TABLE trace_tags AS default.trace_tags").execute().await?;
+            isolated.query("CREATE TABLE spans AS default.spans").execute().await?;
+            isolated.query("CREATE TABLE evaluation_datapoints AS default.evaluation_datapoints").execute().await?;
+            let migration = include_str!("../../../frontend/lib/clickhouse/migrations/84_span_accounting.sql");
+            let migration = migration.replace("default.", &format!("{database}."))
+                .replace("'clusters_dict'", "'default.clusters_dict'");
+            for statement in migration.split(";\n").filter(|statement| !statement.trim().is_empty()) {
+                isolated.query(statement).execute().await?;
+            }
+            let migration = include_str!("../../../frontend/lib/clickhouse/migrations/85_canonical_spans.sql");
+            let mut migration = migration.replace("default.", &format!("{database}."));
+            for dictionary in ["clusters_dict", "unique_content_dict", "deduped_content_dict", "trace_access_policy_dict", "evaluations_dict"] {
+                migration = migration.replace(&format!("'{dictionary}'"), &format!("'default.{dictionary}'"));
+            }
+            for statement in migration.split(";\n").filter(|statement| !statement.trim().is_empty()) {
+                isolated.query(statement).execute().await?;
+            }
+            let mut row = CHTraceAgg::zero_sum_partial(Uuid::new_v4(), Uuid::new_v4(), 1_700_000_000_000_000_000);
+            row.end_time = row.start_time + 1_000_000_000;
+            row.span_accounting.insert("model-call".into(), SpanAccounting {
+                input_tokens: 11, output_tokens: 2, total_tokens: 13,
+                input_cost: 0.25, output_cost: 0.125, total_cost: 0.375,
+                ..Default::default()
+            });
+            row.span_accounting.insert("tool-call".into(), SpanAccounting::default());
+            let writer = crate::ch::cloud::CloudClickhouse::new(isolated.clone());
+            for _ in 0..2 {
+                crate::ch::ClickhouseTrait::insert_batch(&writer, std::slice::from_ref(&row), None).await?;
+            }
+            #[derive(Row, Deserialize)]
+            struct Totals { tokens: i64, spans: u64, cost: f64 }
+            let totals = isolated.query("SELECT sum(total_tokens) + arraySum(value -> value.3, mapValues(maxMap(span_accounting))) AS tokens, sum(num_spans) + length(mapKeys(maxMap(span_accounting))) AS spans, sum(total_cost) + arraySum(value -> value.9, mapValues(maxMap(span_accounting))) AS cost FROM traces_agg").fetch_one::<Totals>().await?;
+            anyhow::ensure!(totals.tokens == 13 && totals.spans == 2 && totals.cost == 0.375, "replayed RowBinary facts changed accounting");
+            isolated.query("OPTIMIZE TABLE traces_agg FINAL").execute().await?;
+            isolated.query("INSERT INTO traces_static (project_id, trace_id, start_time, input) VALUES (?, ?, fromUnixTimestamp64Nano(?), 'synthetic human input')")
+                .bind(row.project_id).bind(row.id).bind(row.start_time).execute().await?;
+            let mut later = row.clone();
+            later.start_time += 8 * 60 * 60 * 1_000_000_000;
+            later.end_time = later.start_time + 1_000_000_000;
+            later.span_accounting.clear();
+            later.span_accounting.insert("later-call".into(), SpanAccounting {
+                input_tokens: 4, output_tokens: 1, total_tokens: 5,
+                input_cost: 0.125, total_cost: 0.125, ..Default::default()
+            });
+            crate::ch::ClickhouseTrait::insert_batch(&writer, std::slice::from_ref(&later), None).await?;
+            isolated.query("INSERT INTO traces_static (project_id, trace_id, start_time, release) VALUES (?, ?, fromUnixTimestamp64Nano(?), 'late-release')")
+                .bind(row.project_id).bind(row.id).bind(later.start_time).execute().await?;
+            #[derive(Row, Deserialize)]
+            struct NativeTrace { tokens: i64, cost: f64, input: String, release: String }
+            for view in ["traces_v0", "traces_v1"] {
+                let policy = if view == "traces_v1" { ", policy='{}'" } else { "" };
+                let sql = format!("SELECT total_tokens AS tokens, total_cost AS cost, agent_input AS input, release FROM {view}(project_id=?, min_start_time=fromUnixTimestamp64Nano(?), max_start_time=fromUnixTimestamp64Nano(?){policy}) WHERE id=?");
+                let trace = isolated.query(&sql).bind(row.project_id)
+                    .bind(row.start_time - 3 * 60 * 60 * 1_000_000_000)
+                    .bind(row.start_time + 4 * 60 * 60 * 1_000_000_000)
+                    .bind(row.id).fetch_one::<NativeTrace>().await?;
+                anyhow::ensure!(trace.tokens == 18 && trace.cost == 0.5 && trace.input == "synthetic human input" && trace.release == "late-release", "{view} clipped late usage or static fields");
+            }
+
+            // Exercise the same policy-aware rewrite as the monitor, not only
+            // direct view calls: recent activity must retain an older request.
+            let validator = crate::query_engine::validator::QueryValidator::new();
+            for time_column in ["end_time", "start_time"] {
+                let sql = format!(
+                    "SELECT total_tokens AS tokens, total_cost AS cost, agent_input AS input, release \
+                     FROM traces WHERE {time_column} >= fromUnixTimestamp64Nano({}) \
+                     AND {time_column} <= fromUnixTimestamp64Nano({}) ORDER BY {time_column} DESC LIMIT 50",
+                    later.start_time - 60 * 60 * 1_000_000_000,
+                    later.end_time + 1_000_000_000,
+                );
+                let secured = validator.validate_and_secure_query(&sql, &row.project_id.to_string(), "{}")
+                    .map_err(anyhow::Error::msg)?;
+                let traces = isolated.query(&secured.query).fetch_all::<NativeTrace>().await?;
+                if time_column == "end_time" {
+                    anyhow::ensure!(traces.len() == 1, "activity window lost the older request");
+                    let trace = &traces[0];
+                    anyhow::ensure!(trace.tokens == 18 && trace.cost == 0.5 && trace.input == "synthetic human input" && trace.release == "late-release", "activity window clipped request history");
+                } else {
+                    anyhow::ensure!(traces.is_empty(), "start-time window changed meaning");
+                }
+            }
+
+            // Delivery duplicates can carry different content-dedup markers.
+            // Canonicalization must precede SUM and preserve the first content
+            // occurrence, both before and after physical merges.
+            let span_id = Uuid::new_v4();
+            let insert = "INSERT INTO spans (project_id, trace_id, span_id, name, span_type, start_time, end_time, total_tokens, input, input_new_message_indices) VALUES (?, ?, ?, 'synthetic model', 1, fromUnixTimestamp64Nano(?), fromUnixTimestamp64Nano(?), ?, '\"human input\"', ?)";
+            isolated.query(insert).bind(row.project_id).bind(row.id).bind(span_id)
+                .bind(row.start_time).bind(row.end_time).bind(13_i64).bind(vec![0_u32]).execute().await?;
+            isolated.query(insert).bind(Uuid::new_v4()).bind(row.id).bind(span_id)
+                .bind(row.start_time).bind(row.end_time).bind(100_i64).bind(vec![0_u32]).execute().await?;
+            #[derive(Row, Deserialize)]
+            struct CanonicalTotals { count: u64, tokens: i64 }
+            for merged in [false, true] {
+                if merged {
+                    isolated.query("OPTIMIZE TABLE spans FINAL").execute().await?;
+                }
+                isolated.query(insert).bind(row.project_id).bind(row.id).bind(span_id)
+                    .bind(row.start_time).bind(row.end_time).bind(13_i64).bind(Vec::<u32>::new()).execute().await?;
+                for view in ["spans_v0", "spans_v1"] {
+                    let policy = if view == "spans_v1" { ", policy='{}'" } else { "" };
+                    let totals = isolated.query(&format!("SELECT count(), sum(total_tokens) FROM {view}(project_id=?{policy}) WHERE trace_id=?"))
+                        .bind(row.project_id).bind(row.id).fetch_one::<CanonicalTotals>().await?;
+                    anyhow::ensure!(totals.count == 1 && totals.tokens == 13, "{view} counted a repeated or foreign-project operation");
+                }
+            }
+            let indices = isolated.query("SELECT toJSONString(input_new_message_indices) FROM spans_canonical WHERE project_id=? AND trace_id=?")
+                .bind(row.project_id).bind(row.id).fetch_one::<String>().await?;
+            anyhow::ensure!(indices == "[0]", "replay hid the original content occurrence");
+            let masked = isolated.query("SELECT input FROM spans_v1(project_id=?,policy='{\"maskPii\":true}') WHERE trace_id=?")
+                .bind(row.project_id).bind(row.id).fetch_one::<String>().await?;
+            anyhow::ensure!(masked == "\"[PII_MASKED_UNAVAILABLE]\"", "canonicalization exposed unchecked content");
+            Ok(())
+        }.await;
+        client
+            .query(&format!("DROP DATABASE {database} SYNC"))
+            .execute()
+            .await?;
+        result
+    }
+
     // A patch learns nothing about the trace's end, so `end_time` must be the
     // `max` identity — `max` can never be lowered again once a too-late value
     // merges in. `start_time` takes the caller's resolved trace start so the
@@ -324,16 +472,21 @@ mod tests {
     #[test]
     fn metadata_patch_uses_max_identity_end_and_the_resolved_start() {
         let resolved_start = 1_700_000_000_000_000_000;
-        let row = CHTraceAgg::from_metadata_patch(
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Some(&json!({"k": "v"})),
-            resolved_start,
-        );
+        let patch = TraceMetadataPatch {
+            span_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            metadata: json!({"k": "v"}),
+        };
+        let row = CHTraceAgg::from_metadata_patch(&patch, resolved_start);
         assert_eq!(row.end_time, 0, "max identity for end_time");
         assert_eq!(row.start_time, resolved_start);
-        // The +1 pays for the virtual metadata-only span that drove the patch.
-        assert_eq!(row.num_spans, 1);
+        assert_eq!(row.num_spans, 0);
+        assert_eq!(row.span_accounting.len(), 1);
+        assert_eq!(
+            row.span_accounting[&patch.span_id.simple().to_string()],
+            SpanAccounting::default()
+        );
         // Every other aggregate is an identity.
         assert_eq!(row.total_tokens, 0);
         assert_eq!(row.total_cost, 0.0);

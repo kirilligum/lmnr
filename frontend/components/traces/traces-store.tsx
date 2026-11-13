@@ -1,9 +1,10 @@
-import { parseISO } from "date-fns";
 import { createContext, type PropsWithChildren, useContext, useState } from "react";
 import { createStore } from "zustand";
 import { useStoreWithEqualityFn } from "zustand/traditional";
 
 import { type TracesStatsDataPoint } from "@/lib/actions/traces/stats";
+import { fetchApi } from "@/lib/api/fetch-api";
+import { toast } from "@/lib/hooks/use-toast";
 
 type TracesState = {
   traceId: string | null;
@@ -16,10 +17,8 @@ type TracesState = {
 type TracesActions = {
   setTraceId: (traceId: string | null) => void;
   setSpanId: (spanId: string | null) => void;
-  fetchStats: (url: string) => Promise<void>;
-  incrementStat: (timestamp: string, isError: boolean) => void;
+  fetchStats: (url: string, background?: boolean) => Promise<void>;
   setChartContainerWidth: (width: number) => void;
-  isTraceInTimeRange: (timestamp: string) => boolean;
 };
 
 export interface TracesProps {
@@ -40,7 +39,8 @@ const createTracesStore = (initProps?: Partial<TracesProps>) => {
     chartContainerWidth: null,
   };
 
-  return createStore<TracesStore>()((set, get) => ({
+  let statsRequest: AbortController | undefined;
+  return createStore<TracesStore>()((set) => ({
     ...DEFAULT_PROPS,
     ...initProps,
 
@@ -50,64 +50,30 @@ const createTracesStore = (initProps?: Partial<TracesProps>) => {
 
     setChartContainerWidth: (width: number) => set({ chartContainerWidth: width }),
 
-    fetchStats: async (url: string) => {
-      set({ isLoadingStats: true });
+    fetchStats: async (url, background = false) => {
+      statsRequest?.abort();
+      const controller = new AbortController();
+      statsRequest = controller;
+      if (!background) set({ isLoadingStats: true });
       try {
-        const response = await fetch(url);
-        if (!response.ok) {
-          throw new Error(`Failed to fetch stats: ${response.status} ${response.statusText}`);
-        }
-        const data = (await response.json()) as { items: TracesStatsDataPoint[] };
-
-        set({ stats: data.items, isLoadingStats: false });
+        const { data, error } = await fetchApi<{ items: TracesStatsDataPoint[] }>(url, { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        if (error !== null) throw new Error(error);
+        set({ stats: data.items });
       } catch (error) {
-        console.error("Failed to fetch stats:", error);
-        set({ isLoadingStats: false });
+        if (!controller.signal.aborted) {
+          toast({
+            title: "Failed to load trace statistics",
+            description: error instanceof Error ? error.message : String(error),
+            variant: "destructive",
+          });
+        }
+      } finally {
+        if (statsRequest === controller) {
+          statsRequest = undefined;
+          set({ isLoadingStats: false });
+        }
       }
-    },
-
-    isTraceInTimeRange: (timestamp: string) => {
-      const { stats } = get();
-      if (!stats || stats.length === 0) return false;
-
-      const traceTime = parseISO(timestamp);
-
-      const bucketIndex = stats.findIndex((stat, idx) => {
-        const bucketStart = parseISO(stat.timestamp);
-        const bucketEnd = idx < stats.length - 1 ? parseISO(stats[idx + 1].timestamp) : new Date(8640000000000000);
-
-        return traceTime >= bucketStart && traceTime < bucketEnd;
-      });
-
-      return bucketIndex !== -1;
-    },
-
-    incrementStat: (timestamp: string, isError: boolean) => {
-      const { stats } = get();
-      if (!stats || stats?.length === 0) return;
-
-      const traceTime = parseISO(timestamp);
-
-      const bucketIndex = stats.findIndex((stat, idx) => {
-        const bucketStart = parseISO(stat.timestamp);
-        const bucketEnd = idx < stats.length - 1 ? parseISO(stats[idx + 1].timestamp) : new Date(8640000000000000);
-
-        return traceTime >= bucketStart && traceTime < bucketEnd;
-      });
-
-      if (bucketIndex === -1) return;
-
-      set({
-        stats: stats.map((stat, idx) =>
-          idx === bucketIndex
-            ? ({
-                timestamp: stat.timestamp,
-                successCount: isError ? stat.successCount : stat.successCount + 1,
-                errorCount: isError ? stat.errorCount + 1 : stat.errorCount,
-              } as TracesStatsDataPoint)
-            : stat
-        ),
-      });
     },
   }));
 };

@@ -18,6 +18,7 @@ import { buildColumnDefs, toColumnsPayload } from "@/components/traces/traces-ta
 import { useTableConfigStore, useTableView } from "@/components/ui/infinite-datatable/model/table-config-store";
 import { InfiniteDataTableProvider } from "@/components/ui/infinite-datatable/model/table-store";
 import { type ColumnFilter } from "@/components/ui/infinite-datatable/ui/datatable-filter/utils";
+import { monitorTimeField } from "@/lib/traces/time-filter";
 import { cn } from "@/lib/utils";
 
 export default function TracesTable({ className, ...props }: ComponentProps<"div">) {
@@ -50,6 +51,7 @@ function TracesTableContent() {
   const startDate = searchParams.get("startDate");
   const endDate = searchParams.get("endDate");
   const pastHours = searchParams.get("pastHours");
+  const timeField = monitorTimeField(searchParams.get("timeField"));
   const searchIn = searchParams.getAll("searchIn");
 
   const { effective, isLoading: isViewLoading, setSort, setSearchAndFilters, setFilters } = useTableView();
@@ -118,6 +120,7 @@ function TracesTableContent() {
     endDate,
     filters: filter,
     additionalParams: {
+      timeField,
       ...(textSearchFilter && { search: textSearchFilter }),
       ...(searchIn.length > 0 && { searchIn }),
       ...(customColumnsJson && { customColumns: customColumnsJson }),
@@ -141,6 +144,10 @@ function TracesTableContent() {
   const handleRefresh = useCallback(() => {
     refetchRef.current();
     if (statsUrl) fetchStats(statsUrl);
+  }, [statsUrl, fetchStats]);
+
+  const handleRefreshStats = useCallback(() => {
+    if (statsUrl) void fetchStats(statsUrl, true);
   }, [statsUrl, fetchStats]);
 
   const handleClearFilters = useCallback(() => {
@@ -175,6 +182,7 @@ function TracesTableContent() {
     <div className="flex flex-1 overflow-hidden px-4 pb-4">
       <TracesTableContents
         refetchRef={refetchRef}
+        onRefreshStats={handleRefreshStats}
         columnDefs={columnDefs}
         effectiveColumns={effectiveColumns}
         pinnedColumns={pinnedColumns}
@@ -186,6 +194,7 @@ function TracesTableContent() {
         onSort={handleSort}
         onClearFilters={handleClearFilters}
         pastHours={pastHours}
+        timeField={timeField}
         startDate={startDate}
         endDate={endDate}
         searchIn={searchIn}

@@ -150,7 +150,7 @@ pub async fn get_model_costs_for_project(
     project_id: &Uuid,
     orig_provider_name: &str,
     orig_model_name: &str,
-) -> Option<ModelCosts> {
+) -> anyhow::Result<Option<ModelCosts>> {
     // Lowercase to match the frontend which lowercases provider/model before DB storage
     let orig_provider = orig_provider_name.to_lowercase();
     let orig_model = orig_model_name.to_lowercase();
@@ -163,9 +163,9 @@ pub async fn get_model_costs_for_project(
         &orig_model,
         project_id,
     )
-    .await
+    .await?
     {
-        return Some(costs);
+        return Ok(Some(costs));
     }
 
     // Fall back to universal model costs
@@ -181,9 +181,9 @@ async fn get_custom_model_costs(
     provider: &str,
     model: &str,
     project_id: &Uuid,
-) -> Option<ModelCosts> {
+) -> anyhow::Result<Option<ModelCosts>> {
     if model.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let cache_key = format!(
@@ -194,7 +194,7 @@ async fn get_custom_model_costs(
     // Check cache first
     match cache.get::<Option<ModelCosts>>(&cache_key).await {
         Ok(Some(maybe_costs)) => {
-            return maybe_costs;
+            return Ok(maybe_costs);
         }
         Ok(None) => {} // Cache miss
         Err(e) => {
@@ -226,7 +226,7 @@ async fn get_custom_model_costs(
                 provider,
                 e
             );
-            return None;
+            return Err(e.into());
         }
     };
 
@@ -238,7 +238,7 @@ async fn get_custom_model_costs(
     };
     let _ = cache.insert_with_ttl(&cache_key, result.clone(), ttl).await;
 
-    result
+    Ok(result)
 }
 
 /// Look up model costs from cache or DB, trying lookup keys in priority order.
@@ -249,7 +249,7 @@ pub async fn get_model_costs(
     db: Arc<DB>,
     cache: Arc<Cache>,
     model_info: &ModelInfo,
-) -> Option<ModelCosts> {
+) -> anyhow::Result<Option<ModelCosts>> {
     log::debug!(
         "Getting model costs for model: {}, provider: {:?}",
         model_info.model,
@@ -261,7 +261,7 @@ pub async fn get_model_costs(
     // Check canonical cache key
     match cache.get::<Option<ModelCosts>>(&cache_key).await {
         Ok(Some(maybe_costs)) => {
-            return maybe_costs;
+            return Ok(maybe_costs);
         }
         Ok(None) => {} // Cache miss, query DB
         Err(e) => {
@@ -283,7 +283,7 @@ pub async fn get_model_costs(
                 keys,
                 e
             );
-            return None;
+            return Err(e.into());
         }
     };
 
@@ -315,5 +315,5 @@ pub async fn get_model_costs(
             .await;
     }
 
-    result
+    Ok(result)
 }

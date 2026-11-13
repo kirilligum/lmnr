@@ -5,15 +5,15 @@ import { type Filter } from "@/lib/actions/common/filters";
 import { buildTimeRangeWithFill } from "@/lib/actions/common/query-builder";
 import { executeQuery } from "@/lib/actions/sql";
 import { GetTracesSchema } from "@/lib/actions/traces";
-import { searchSpans } from "@/lib/actions/traces/search";
+import { searchRequestSpans } from "@/lib/actions/traces/search-requests";
 import { type TracesStatsDataPoint } from "@/lib/actions/traces/stats-types";
 import {
   buildTracesStatsWhereConditions,
   generateEmptyTimeBuckets,
   parseCustomColumnsJson,
 } from "@/lib/actions/traces/utils";
-import { type SpanSearchType } from "@/lib/clickhouse/types";
 import { getTimeRange } from "@/lib/clickhouse/utils";
+import { traceTimeColumn } from "@/lib/traces/time-filter";
 
 export const GetTraceStatsSchema = GetTracesSchema.omit({
   pageNumber: true,
@@ -31,6 +31,7 @@ export async function getTraceStats(
   const {
     projectId,
     pastHours,
+    timeField,
     startDate: startTime,
     endDate: endTime,
     traceType,
@@ -46,14 +47,18 @@ export async function getTraceStats(
 
   const customColumns = parseCustomColumnsJson(customColumnsJson);
 
-  const spanHits: { trace_id: string; span_id: string }[] = search
-    ? await searchSpans({
-        projectId,
-        searchQuery: search,
-        timeRange: getTimeRange(pastHours, startTime, endTime),
-        searchType: searchIn as SpanSearchType[],
-      })
-    : [];
+  const spanHits = await searchRequestSpans({
+    projectId,
+    search,
+    searchIn,
+    startTime,
+    endTime,
+    pastHours,
+    timeField,
+    traceType,
+    filters,
+    customColumns,
+  });
   const traceIds = [...new Set(spanHits.map((span) => span.trace_id))];
 
   if (search && traceIds?.length === 0) {
@@ -78,7 +83,7 @@ export async function getTraceStats(
     startTime,
     endTime,
     pastHours,
-    timeColumn: "start_time",
+    timeColumn: traceTimeColumn(timeField),
     intervalValue,
     intervalUnit,
   });
@@ -98,7 +103,7 @@ export async function getTraceStats(
 
   const query = `
     SELECT 
-      toStartOfInterval(start_time, toInterval({intervalValue:UInt32}, {intervalUnit:String})) as timestamp,
+      toStartOfInterval(${traceTimeColumn(timeField)}, toInterval({intervalValue:UInt32}, {intervalUnit:String})) as timestamp,
       countIf(status != 'error') as successCount,
       countIf(status = 'error') as errorCount
     FROM traces

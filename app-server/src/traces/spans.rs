@@ -1373,7 +1373,7 @@ pub fn should_keep_attribute(attribute: &str) -> bool {
     true
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpanUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -1387,6 +1387,10 @@ pub struct SpanUsage {
     pub request_model: Option<String>,
     pub response_model: Option<String>,
     pub provider_name: Option<String>,
+    /// The accepted rate card or explicit-cost provenance, retained with the
+    /// accounting receipt rather than recalculated on delivery retries.
+    #[serde(default)]
+    pub pricing_basis: Value,
 }
 
 fn input_chat_messages_from_genai_attributes(

@@ -340,6 +340,7 @@ mod tests {
             span_names: HashSet::new(),
             release: None,
             agent_versions: Vec::new(),
+            span_accounting: Default::default(),
         }
     }
 

@@ -1,14 +1,16 @@
 "use client";
 
-import { type DependencyList, useCallback, useEffect } from "react";
+import { type DependencyList, useCallback, useEffect, useRef } from "react";
 import { shallow } from "zustand/shallow";
 import { useStoreWithEqualityFn } from "zustand/traditional";
+
+import { createPagedLoader } from "@/lib/paged-loader";
 
 import { useTableConfigStore } from "../model/table-config-store.tsx";
 import { useTableStore } from "../model/table-store.tsx";
 
 export interface InfiniteScrollOptions<TData> {
-  fetchFn: (pageParam: number) => Promise<{ items: TData[]; count?: number }>;
+  fetchFn: (pageParam: number, signal?: AbortSignal) => Promise<{ items: TData[]; count?: number }>;
   enabled?: boolean;
   deps?: DependencyList;
 }
@@ -18,11 +20,10 @@ export function useInfiniteScroll<TData>({ fetchFn, enabled = true, deps = [] }:
   // Auto-gate on view resolution; no-op for tables without views.
   const isViewLoading = useTableConfigStore((s) => s.isViewLoading);
 
-  const { data, currentPage, isFetching, isLoading, error, hasMore } = useStoreWithEqualityFn(
+  const { data, isFetching, isLoading, error, hasMore } = useStoreWithEqualityFn(
     store,
     (state) => ({
       data: state.data,
-      currentPage: state.currentPage,
       isFetching: state.isFetching,
       isLoading: state.isLoading,
       error: state.error,
@@ -31,84 +32,63 @@ export function useInfiniteScroll<TData>({ fetchFn, enabled = true, deps = [] }:
     shallow
   );
 
-  const {
-    setIsFetching,
-    setIsLoading,
-    setCurrentPage,
-    replaceData,
-    appendData,
-    setError,
-    setData,
-    resetInfiniteScroll,
-  } = useStoreWithEqualityFn(
-    store,
-    (state) => ({
-      setIsFetching: state.setIsFetching,
-      setIsLoading: state.setIsLoading,
-      setCurrentPage: state.setCurrentPage,
-      replaceData: state.replaceData,
-      appendData: state.appendData,
-      setData: state.setData,
-      setError: state.setError,
-      resetInfiniteScroll: state.resetInfiniteScroll,
-    }),
-    shallow
-  );
-
+  const loader = useRef<ReturnType<typeof createPagedLoader<TData>> | null>(null);
+  const fetchFnRef = useRef(fetchFn);
+  useEffect(() => {
+    fetchFnRef.current = fetchFn;
+  }, [fetchFn]);
   const depsString = JSON.stringify(deps);
 
-  const fetchPage = useCallback(
-    async (pageNumber: number, shouldReset: boolean = false) => {
-      if (!enabled) return;
-
-      try {
-        setIsFetching(true);
-        if (shouldReset) {
-          setIsLoading(true);
-        }
-
-        const result = await fetchFn(pageNumber);
-
-        if (shouldReset) {
-          replaceData(result.items, result.count);
-        } else {
-          appendData(result.items, result.count);
-        }
-        setCurrentPage(pageNumber);
-      } catch (err) {
-        setError(err instanceof Error ? err : new Error("Failed to fetch data"));
-        setIsFetching(false);
-        setIsLoading(false);
-      }
-    },
-    [enabled, setIsFetching, fetchFn, setCurrentPage, setIsLoading, replaceData, appendData, setError]
-  );
-
   const fetchNextPage = useCallback(() => {
-    if (!isFetching && hasMore) {
-      fetchPage(currentPage + 1, false);
-    }
-  }, [isFetching, hasMore, currentPage, fetchPage]);
+    const state = store.getState();
+    if (!state.isFetching && state.hasMore) void loader.current?.load(state.currentPage + 1);
+  }, [store]);
 
   const refetch = useCallback(() => {
-    // Same guard as the deps effect below: fetchPage no-ops when disabled,
-    // so resetting first would clear the table without a follow-up load.
-    if (!enabled || isViewLoading) return;
-    resetInfiniteScroll();
-    fetchPage(0, true);
-  }, [fetchPage, enabled, isViewLoading, resetInfiniteScroll]);
-
-  const updateData = useCallback((updater: (prevData: TData[]) => TData[]) => {
-    setData(updater);
+    void loader.current?.load(0, true);
   }, []);
+  const refresh = useCallback(() => {
+    loader.current?.invalidate();
+  }, []);
+  const updateData = useCallback(
+    (updater: (prevData: TData[]) => TData[]) => {
+      store.getState().setData(updater);
+    },
+    [store]
+  );
 
   useEffect(() => {
-    if (enabled && !isViewLoading) {
-      resetInfiniteScroll();
-      fetchPage(0, true);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, isViewLoading, depsString]);
+    if (!enabled || isViewLoading) return;
+    const instance = createPagedLoader<TData>({
+      fetchPage: (page, signal) => fetchFnRef.current(page, signal),
+      getCurrentPage: () => store.getState().currentPage,
+      pageSize: store.getState().pageSize,
+      onStart: (reset) => {
+        const state = store.getState();
+        if (reset) state.resetInfiniteScroll();
+        state.setIsFetching(true);
+        if (reset) state.setIsLoading(true);
+      },
+      onResult: (result, page, replace, more) => {
+        const state = store.getState();
+        if (replace) state.replaceData(result.items, result.count);
+        else state.appendData(result.items, result.count);
+        state.setCurrentPage(page);
+        state.setHasMore(more);
+      },
+      onError: (error) => store.getState().setError(error),
+      onIdle: () => {
+        store.getState().setIsFetching(false);
+        store.getState().setIsLoading(false);
+      },
+    });
+    loader.current = instance;
+    void instance.load(0, true);
+    return () => {
+      instance.cancel();
+      if (loader.current === instance) loader.current = null;
+    };
+  }, [enabled, isViewLoading, depsString, store]);
 
   return {
     data,
@@ -119,6 +99,7 @@ export function useInfiniteScroll<TData>({ fetchFn, enabled = true, deps = [] }:
     error,
     fetchNextPage,
     refetch,
+    refresh,
     updateData,
   };
 }

@@ -1,11 +1,52 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{traces_agg::CHTraceAgentVersion, utils::merge_json_objects};
 use crate::db::spans::{Span, SpanType};
 use crate::traces::spans::SpanUsage;
+
+/// One immutable operation's accounting fact. The ClickHouse Map value is this
+/// tuple in field order; replay merges by span id before any counters are summed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpanAccounting {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub input_cost: f64,
+    pub output_cost: f64,
+    pub total_cost: f64,
+}
+
+impl SpanAccounting {
+    fn from_span(span: &Span, usage: &SpanUsage) -> Self {
+        if !span.is_llm_span() {
+            return Self::default();
+        }
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens as u64,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens as u64,
+            reasoning_tokens: usage.reasoning_tokens as u64,
+            input_cost: usage.input_cost,
+            output_cost: usage.output_cost,
+            total_cost: usage.total_cost,
+        }
+    }
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct TraceKey {
+    project_id: Uuid,
+    trace_id: Uuid,
+}
 
 /// One batch's trace-stats delta. Folded by `traces_agg` (aggregates) and
 /// `traces_static` (set-once columns); never a cumulative row.
@@ -39,6 +80,7 @@ pub struct TraceAggregation {
     pub release: Option<String>,
     /// Versions of the trace's decided releases, tagged at ingest.
     pub agent_versions: Vec<CHTraceAgentVersion>,
+    pub span_accounting: BTreeMap<String, SpanAccounting>,
 }
 
 impl TraceAggregation {
@@ -46,41 +88,49 @@ impl TraceAggregation {
     pub fn from_spans(spans: &[Span], span_usage_vec: &[SpanUsage]) -> Vec<Self> {
         use std::collections::HashMap;
 
-        let mut trace_aggregations: HashMap<Uuid, TraceAggregation> = HashMap::new();
+        let mut trace_aggregations: HashMap<TraceKey, TraceAggregation> = HashMap::new();
 
         for (span, span_usage) in spans.iter().zip(span_usage_vec.iter()) {
-            let entry =
-                trace_aggregations
-                    .entry(span.trace_id)
-                    .or_insert_with(|| TraceAggregation {
-                        trace_id: span.trace_id,
-                        project_id: span.project_id,
-                        start_time: None,
-                        end_time: None,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        total_tokens: 0,
-                        cache_read_input_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                        reasoning_tokens: 0,
-                        input_cost: 0.0,
-                        output_cost: 0.0,
-                        total_cost: 0.0,
-                        session_id: None,
-                        user_id: None,
-                        status: None,
-                        metadata: None,
-                        tags: HashSet::new(),
-                        num_spans: 0,
-                        top_span_id: None,
-                        top_span_name: None,
-                        top_span_type: 0,
-                        trace_type: 0,
-                        has_browser_session: None,
-                        span_names: HashSet::new(),
-                        release: None,
-                        agent_versions: Vec::new(),
-                    });
+            let entry = trace_aggregations
+                .entry(TraceKey {
+                    project_id: span.project_id,
+                    trace_id: span.trace_id,
+                })
+                .or_insert_with(|| TraceAggregation {
+                    trace_id: span.trace_id,
+                    project_id: span.project_id,
+                    start_time: None,
+                    end_time: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    reasoning_tokens: 0,
+                    input_cost: 0.0,
+                    output_cost: 0.0,
+                    total_cost: 0.0,
+                    session_id: None,
+                    user_id: None,
+                    status: None,
+                    metadata: None,
+                    tags: HashSet::new(),
+                    num_spans: 0,
+                    top_span_id: None,
+                    top_span_name: None,
+                    top_span_type: 0,
+                    trace_type: 0,
+                    has_browser_session: None,
+                    span_names: HashSet::new(),
+                    release: None,
+                    agent_versions: Vec::new(),
+                    span_accounting: BTreeMap::new(),
+                });
+
+            entry
+                .span_accounting
+                .entry(span.span_id.simple().to_string())
+                .or_insert_with(|| SpanAccounting::from_span(span, span_usage));
 
             // Aggregate min start_time
             entry.start_time = Some(match entry.start_time {
@@ -93,22 +143,6 @@ impl TraceAggregation {
                 Some(existing) => existing.max(span.end_time),
                 None => span.end_time,
             });
-
-            // Sum tokens and costs from SpanUsage — LLM spans only. `get_llm_usage_for_span`
-            // computes usage for every span (it reads `gen_ai.usage.*` unconditionally), so a
-            // non-LLM span carrying those attributes would otherwise inflate the trace totals.
-            // This mirrors `prepare_span_for_recording`, which records usage only on LLM spans.
-            if span.is_llm_span() {
-                entry.input_tokens += span_usage.input_tokens;
-                entry.output_tokens += span_usage.output_tokens;
-                entry.total_tokens += span_usage.total_tokens;
-                entry.cache_read_input_tokens += span_usage.cache_read_input_tokens;
-                entry.cache_creation_input_tokens += span_usage.cache_creation_input_tokens;
-                entry.reasoning_tokens += span_usage.reasoning_tokens;
-                entry.input_cost += span_usage.input_cost;
-                entry.output_cost += span_usage.output_cost;
-                entry.total_cost += span_usage.total_cost;
-            }
 
             // Use "any" strategy for these fields (take first non-empty value)
             if entry.session_id.is_none() {
@@ -184,10 +218,25 @@ impl TraceAggregation {
                     entry.has_browser_session = Some(has_browser_session);
                 }
             }
-
-            entry.num_spans += 1;
         }
 
+        // Consumers of the in-memory aggregate must see the same unique
+        // operations as the persistent accounting map, even if a queue batch
+        // contains both an original delivery and its retry.
+        for aggregate in trace_aggregations.values_mut() {
+            aggregate.num_spans = aggregate.span_accounting.len() as i32;
+            for fact in aggregate.span_accounting.values() {
+                aggregate.input_tokens += fact.input_tokens;
+                aggregate.output_tokens += fact.output_tokens;
+                aggregate.total_tokens += fact.total_tokens;
+                aggregate.cache_read_input_tokens += fact.cache_read_input_tokens as i64;
+                aggregate.cache_creation_input_tokens += fact.cache_creation_input_tokens as i64;
+                aggregate.reasoning_tokens += fact.reasoning_tokens as i64;
+                aggregate.input_cost += fact.input_cost;
+                aggregate.output_cost += fact.output_cost;
+                aggregate.total_cost += fact.total_cost;
+            }
+        }
         trace_aggregations.into_values().collect()
     }
 }
@@ -204,7 +253,7 @@ mod tests {
     fn make_span(trace_id: Uuid, span_type: SpanType, output_tokens: i64) -> Span {
         Span {
             span_id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
+            project_id: Uuid::from_u128(1),
             trace_id,
             parent_span_id: None,
             name: "test".to_string(),
@@ -238,6 +287,7 @@ mod tests {
             request_model: None,
             response_model: None,
             provider_name: None,
+            pricing_basis: serde_json::Value::Null,
         }
     }
 
@@ -302,5 +352,81 @@ mod tests {
         let aggregations = TraceAggregation::from_spans(&spans, &usage);
 
         assert_eq!(aggregations[0].release, Some("abc1234".to_string()));
+    }
+
+    #[test]
+    fn accounting_identity_survives_replay_and_rebatching() {
+        let trace = Uuid::new_v4();
+        let model = make_span(trace, SpanType::LLM, 13);
+        let tool = make_span(trace, SpanType::Tool, 100);
+        let usage = [make_usage(13, 0.25), make_usage(100, 10.0)];
+        let combined = TraceAggregation::from_spans(&[model.clone(), tool.clone()], &usage);
+        let reversed = TraceAggregation::from_spans(
+            &[tool.clone(), model.clone()],
+            &[make_usage(100, 10.0), make_usage(13, 0.25)],
+        );
+        assert_eq!(combined[0].span_accounting, reversed[0].span_accounting);
+        let mut split = TraceAggregation::from_spans(std::slice::from_ref(&model), &usage[..1])
+            .remove(0)
+            .span_accounting;
+        split.extend(
+            TraceAggregation::from_spans(&[tool], &usage[1..])
+                .remove(0)
+                .span_accounting,
+        );
+        split.extend(
+            TraceAggregation::from_spans(&[model], &usage[..1])
+                .remove(0)
+                .span_accounting,
+        );
+        assert_eq!(combined[0].span_accounting, split);
+        assert_eq!(split.len(), 2);
+        assert_eq!(
+            split.values().map(|fact| fact.total_tokens).sum::<i64>(),
+            13
+        );
+        let persisted = crate::ch::traces_agg::CHTraceAgg::from_aggregation(&combined[0], 0);
+        assert_eq!(
+            persisted.total_tokens, 0,
+            "new facts must not also enter legacy additive counters"
+        );
+        assert_eq!(persisted.num_spans, 0);
+        assert_eq!(persisted.span_accounting, split);
+    }
+
+    #[test]
+    fn repeated_operations_in_one_queue_batch_count_once() {
+        let model = make_span(Uuid::new_v4(), SpanType::LLM, 13);
+        let rows = TraceAggregation::from_spans(
+            &[model.clone(), model],
+            &[make_usage(13, 0.25), make_usage(13, 0.25)],
+        );
+        assert_eq!(rows[0].total_tokens, 13);
+        assert_eq!(rows[0].total_cost, 0.25);
+        assert_eq!(rows[0].num_spans, 1);
+    }
+
+    #[test]
+    fn identical_trace_and_span_ids_are_scoped_to_project() {
+        let first = make_span(Uuid::new_v4(), SpanType::LLM, 13);
+        let mut second = first.clone();
+        second.project_id = Uuid::from_u128(2);
+        let rows = TraceAggregation::from_spans(
+            &[first, second],
+            &[make_usage(13, 0.25), make_usage(27, 0.5)],
+        );
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let expected = if row.project_id == Uuid::from_u128(1) {
+                13
+            } else {
+                27
+            };
+            assert_eq!(row.span_accounting.len(), 1);
+            assert_eq!(
+                row.span_accounting.values().next().unwrap().total_tokens,
+                expected
+            );
+        }
     }
 }

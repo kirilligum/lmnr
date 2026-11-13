@@ -1,6 +1,8 @@
+pub(crate) mod accounting;
 pub mod consumer;
 pub mod data_plane_consumer;
 pub mod dedup;
+mod delivery;
 pub mod grpc_service;
 pub mod input_extraction;
 pub mod metadata;

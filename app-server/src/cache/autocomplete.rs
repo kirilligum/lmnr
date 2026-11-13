@@ -20,26 +20,26 @@ const AUTOCOMPLETE_CONFIG: &[(&str, &[&str])] = &[
     (
         "names",
         &[
-            "SELECT arrayJoin(topK(512)(name)) as value FROM spans WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND name != ''",
+            "SELECT arrayJoin(topK(512)(name)) as value FROM spans_canonical AS spans WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND name != ''",
         ],
     ),
     (
         "top_span_names",
         &[
-            "SELECT arrayJoin(topK(512)(name)) as value FROM spans WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND empty(parent_span_id) AND name != ''",
+            "SELECT arrayJoin(topK(512)(name)) as value FROM spans_canonical AS spans WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND empty(parent_span_id) AND name != ''",
         ],
     ),
     (
         "models",
         &[
-            "SELECT arrayJoin(topK(256)(request_model)) as value FROM spans WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND request_model != ''",
-            "SELECT arrayJoin(topK(256)(response_model)) as value FROM spans WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND response_model != ''",
+            "SELECT arrayJoin(topK(256)(request_model)) as value FROM spans_canonical AS spans WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND request_model != ''",
+            "SELECT arrayJoin(topK(256)(response_model)) as value FROM spans_canonical AS spans WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND response_model != ''",
         ],
     ),
     (
         "tags",
         &[
-            "SELECT arrayJoin(topK(512)(tag)) as value FROM spans ARRAY JOIN tags_array AS tag WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND tag != ''",
+            "SELECT arrayJoin(topK(512)(tag)) as value FROM spans_canonical AS spans ARRAY JOIN tags_array AS tag WHERE project_id = {project_id:UUID} AND start_time >= {start_time:DateTime64(9)} AND start_time < {end_time:DateTime64(9)} AND tag != ''",
         ],
     ),
 ];

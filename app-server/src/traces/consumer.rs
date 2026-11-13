@@ -123,6 +123,7 @@ impl SpanHandler {
         process_span_messages(
             messages,
             self.db.clone(),
+            self.db.as_ref(),
             self.clickhouse.clone(),
             self.cache.clone(),
             self.queue.clone(),

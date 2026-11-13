@@ -72,6 +72,7 @@ impl StreamBatchHandler for StreamSpanHandler {
         process_span_messages(
             spans,
             self.db.clone(),
+            self.db.as_ref(),
             self.clickhouse.clone(),
             self.cache.clone(),
             self.queue.clone(),

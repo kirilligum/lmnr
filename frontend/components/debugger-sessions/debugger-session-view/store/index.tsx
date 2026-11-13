@@ -1,5 +1,5 @@
 import { useParams } from "next/navigation";
-import { createContext, type PropsWithChildren, useContext, useState } from "react";
+import { createContext, type PropsWithChildren, useContext, useEffect, useState } from "react";
 import { createStore, type StoreApi, useStore } from "zustand";
 import { persist } from "zustand/middleware";
 
@@ -12,9 +12,9 @@ import { type TraceViewSpan } from "@/components/traces/trace-view/store/base";
 import { enrichSpansWithPending } from "@/components/traces/trace-view/utils";
 import { type SessionBlock } from "@/lib/actions/debugger-sessions";
 import { parseCommandBlockContent } from "@/lib/actions/debugger-sessions/command-content";
+import { fetchApi } from "@/lib/api/fetch-api";
 import { toast } from "@/lib/hooks/use-toast";
 import { createIdBatchLoader } from "@/lib/id-batch-loader";
-import { mergeTraceDelta, realtimeTraceToRow } from "@/lib/traces/realtime";
 import { type RealtimeSpan, type RealtimeTracePayload, type SpanType, type TraceRow } from "@/lib/traces/types";
 import { tryParseJson } from "@/lib/utils";
 
@@ -207,12 +207,6 @@ interface DebuggerSessionViewState {
   // skeleton. Expand always refetches, so a failed fetch heals on re-expand.
   traceSpansFetching: Record<string, boolean>;
 
-  // Traces whose row was seeded from realtime deltas rather than fetched. Their
-  // start/end only span the batches we witnessed, so a span fetch must NOT be
-  // bounded by them — earlier persisted spans would fall outside the window.
-  // Cleared once a fetched (cumulative) row replaces the seed.
-  realtimeSeededTraceIds: Set<string>;
-
   // Displayed session name used by the BREADCRUMB. Seeded from the breadcrumb prop
   // (`name ?? id`) at store creation; updated live by the `session_update` realtime
   // event so a rename reflects without reload.
@@ -281,17 +275,10 @@ interface DebuggerSessionViewActions {
   // Batch entry point for a span_update payload.
   applyRealtimeSpans: (spans: RealtimeSpan[]) => void;
 
-  // Realtime: accumulate a per-batch stat delta onto the run's row, adding the
-  // block (+ auto-expanding) when the run is new to this session.
-  applyTraceUpdate: (delta: RealtimeTracePayload) => void;
-
-  // Batch entry point for a trace_update payload.
-  applyTraceUpdates: (deltas: RealtimeTracePayload[]) => void;
-
-  // Realtime: patch a run's extracted agent_input (arrives async on its own
-  // event). Applied to the row if loaded; buffered otherwise and flushed when
-  // the row's trace_update creates it.
-  applyAgentInput: (traceId: string, agentInput: unknown) => void;
+  // Reconcile stored rows after a notification; payload counters are not totals.
+  refreshTraceRows: (traceIds: string[]) => void;
+  applyTraceUpdates: (notifications: RealtimeTracePayload[]) => void;
+  cancelTraceLoads: () => void;
 
   // Realtime: upsert a pushed note / eval block (by id). Traces are ignored here
   // (they arrive via trace_update).
@@ -322,7 +309,7 @@ interface DebuggerSessionViewActions {
 
 export type DebuggerSessionViewStore = BaseSessionViewStore & DebuggerSessionViewState & DebuggerSessionViewActions;
 
-const createDebuggerSessionViewStore = (options: {
+export const createDebuggerSessionViewStore = (options: {
   initialSessionName?: string;
   initialSessionNameRaw?: string | null;
   projectId?: string;
@@ -334,61 +321,60 @@ const createDebuggerSessionViewStore = (options: {
       (set, get) => {
         const baseSlice = createBaseSessionViewSlice<DebuggerSessionViewStore>(set, get, {});
 
-        // agent_input arrives async on its own event, sometimes before the
-        // run's row exists. Buffer by traceId (latest wins); flushed by
-        // applyTraceUpdate when it creates the row. Closure-scoped per store.
-        const pendingAgentInputById = new Map<string, string>();
-        const stringifyAgentInput = (v: unknown): string => (typeof v === "string" ? v : JSON.stringify(v));
-
+        let blockRequest: AbortController | undefined;
+        const spanRequests = new Map<string, AbortController>();
+        const pendingSpanRefresh = new Set<string>();
         // Lazy trace-row batching: the loader owns the pending set / debounce /
         // chunking; the store owns only the merge + state marks below.
         const rowLoader = createIdBatchLoader<TraceRow>({
           batchSize: 100, // server cap per request
           debounceMs: 150,
           getId: (row) => row.id,
-          fetchBatch: async (ids) => {
+          fetchBatch: async (ids, signal) => {
             const { projectId, sessionId } = options;
             if (!projectId) return [];
             // POST (not `?traceIds=`) so a full window of ids can't overflow the URL.
-            const res = await fetch(`/api/projects/${projectId}/debugger-sessions/${sessionId}/blocks`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ traceIds: ids }),
-            });
-            if (!res.ok) throw new Error("Failed to load runs");
-            const body = (await res.json()) as { traces: TraceRow[] };
-            return (body.traces ?? []).map((t) => ({ ...t, metadata: normalizeMetadata(t.metadata) }));
+            const { data, error } = await fetchApi<{ traces: TraceRow[] }>(
+              `/api/projects/${projectId}/debugger-sessions/${sessionId}/blocks`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ traceIds: ids }),
+                signal,
+              }
+            );
+            if (error !== null) throw new Error(error);
+            return (data.traces ?? []).map((t) => ({ ...t, metadata: normalizeMetadata(t.metadata) }));
           },
-          onBatch: (requestedIds, rowsById) =>
+          onBatch: (requestedIds, rowsById) => {
             set((s) => {
-              // A realtime-seeded row CH doesn't have yet still counts as loaded
-              // (deltas keep it current); truly absent ids are missing.
               const localIds = new Set(s.traces.map((t) => t.id));
               const nextStates = { ...s.traceRowStates };
               for (const id of requestedIds) {
                 nextStates[id] = rowsById.has(id) || localIds.has(id) ? "loaded" : "missing";
               }
-              // A fetched row carries cumulative times, so it supersedes the
-              // seed and its bounds are safe to fetch spans by again.
-              let seeded: Set<string> | null = null;
-              for (const id of rowsById.keys()) {
-                if (!s.realtimeSeededTraceIds.has(id)) continue;
-                if (!seeded) seeded = new Set(s.realtimeSeededTraceIds);
-                seeded.delete(id);
-              }
               return {
                 traceRowStates: nextStates,
                 traces: upsertTraceRows(s.traces, [...rowsById.values()]),
-                ...(seeded ? { realtimeSeededTraceIds: seeded } : {}),
               } as Partial<DebuggerSessionViewStore>;
-            }),
-          onError: (requestedIds) =>
+            });
+            for (const row of rowsById.values()) {
+              if (get().expandedTraceIds.has(row.id) && !get().traceSpans[row.id]) void get().fetchTraceSpans(row);
+            }
+          },
+          onError: (requestedIds) => {
             // Clear the marks so the next scroll-into-view retries the chunk.
             set((s) => {
               const nextStates = { ...s.traceRowStates };
               for (const id of requestedIds) delete nextStates[id];
               return { traceRowStates: nextStates } as Partial<DebuggerSessionViewStore>;
-            }),
+            });
+            toast({
+              variant: "destructive",
+              title: "Failed to refresh runs",
+              description: "Reconnect or reopen the session to retry.",
+            });
+          },
         });
 
         return {
@@ -407,7 +393,6 @@ const createDebuggerSessionViewStore = (options: {
           sessionName: options.initialSessionName ?? "Session",
           sessionNameRaw: options.initialSessionNameRaw ?? null,
           traceSpansFetching: {},
-          realtimeSeededTraceIds: new Set<string>(),
           newBlockNotice: null,
           isInitialTracesLoaded: false,
           expandedCommandBlockIds: new Set<string>(),
@@ -415,7 +400,12 @@ const createDebuggerSessionViewStore = (options: {
           collapsedEvaluationBlockIds: new Set<string>(),
 
           fetchTraceSpans: async (trace) => {
-            if (get().traceSpansFetching[trace.id]) return;
+            if (spanRequests.has(trace.id)) {
+              pendingSpanRefresh.add(trace.id);
+              return;
+            }
+            const controller = new AbortController();
+            spanRequests.set(trace.id, controller);
 
             set(
               (s) =>
@@ -427,25 +417,21 @@ const createDebuggerSessionViewStore = (options: {
             try {
               const { projectId } = get();
               if (!projectId) return;
-              // A realtime-seeded row's times cover only the batches we saw, so
-              // bounding by them would hide spans persisted before we
-              // subscribed. Omitting both dates drops the time predicate
-              // entirely; `trace_id` is what prunes the scan either way.
-              const spanParams = new URLSearchParams();
-              if (!get().realtimeSeededTraceIds.has(trace.id)) {
-                spanParams.set("startDate", new Date(new Date(trace.startTime).getTime() - 1000).toISOString());
-                spanParams.set("endDate", new Date(new Date(trace.endTime).getTime() + 1000).toISOString());
-              }
-              const query = spanParams.size > 0 ? `?${spanParams.toString()}` : "";
-              const res = await fetch(`/api/projects/${projectId}/traces/${trace.id}/spans${query}`);
-              if (!res.ok) throw new Error("Failed to load spans");
-              const fetchedSpans = (await res.json()) as TraceViewSpan[];
+              // A request can grow beyond the last fetched row's time bounds.
+              // trace_id alone prunes the canonical span read without clipping it.
+              const { data: fetchedSpans, error } = await fetchApi<TraceViewSpan[]>(
+                `/api/projects/${projectId}/traces/${trace.id}/spans`,
+                { signal: controller.signal }
+              );
+              if (controller.signal.aborted) return;
+              if (error !== null) throw new Error(error);
               // Always write the slot (even empty) so the expanded body resolves out
               // of its skeleton; merge preserves anything streamed in meanwhile.
               // incomingWins=false: on a re-expand a lagging CH snapshot must not
               // clobber equal-recency live SSE spans — ties keep the live span.
               get().setTraceSpans(trace.id, mergeSpans(get().traceSpans[trace.id] ?? [], fetchedSpans, false));
             } catch {
+              if (controller.signal.aborted) return;
               // The UI keeps whatever streamed; re-expand retries.
               set(
                 (s) =>
@@ -459,12 +445,19 @@ const createDebuggerSessionViewStore = (options: {
                 description: "Collapse and expand the run to retry.",
               });
             } finally {
-              set(
-                (s) =>
-                  ({
-                    traceSpansFetching: { ...s.traceSpansFetching, [trace.id]: false },
-                  }) as Partial<DebuggerSessionViewStore>
-              );
+              if (spanRequests.get(trace.id) === controller) {
+                spanRequests.delete(trace.id);
+                set(
+                  (s) =>
+                    ({
+                      traceSpansFetching: { ...s.traceSpansFetching, [trace.id]: false },
+                    }) as Partial<DebuggerSessionViewStore>
+                );
+                if (pendingSpanRefresh.delete(trace.id)) {
+                  const latest = get().traces.find((row) => row.id === trace.id);
+                  if (latest) void get().fetchTraceSpans(latest);
+                }
+              }
             }
           },
 
@@ -472,16 +465,20 @@ const createDebuggerSessionViewStore = (options: {
             const { projectId } = get();
             if (!projectId) return;
 
+            blockRequest?.abort();
+            const controller = new AbortController();
+            blockRequest = controller;
             get().setIsTracesLoading(true);
             get().setTracesError(undefined);
             try {
-              const res = await fetch(`/api/projects/${projectId}/debugger-sessions/${sessionId}/blocks`);
-              if (!res.ok) {
-                const err = (await res.json().catch(() => ({ error: "Unknown error" }))) as { error?: string };
-                get().setTracesError(err.error || "Failed to load session blocks");
-                return;
-              }
-              const body = (await res.json()) as { blocks: SessionBlock[] };
+              const { data: body, error } = await fetchApi<{ blocks: SessionBlock[] }>(
+                `/api/projects/${projectId}/debugger-sessions/${sessionId}/blocks`,
+                {
+                  signal: controller.signal,
+                }
+              );
+              if (controller.signal.aborted) return;
+              if (error !== null) throw new Error(error);
               const fetchedBlocks = body.blocks ?? [];
 
               // MERGE, don't replace: a run added live mid-fetch is absent from the
@@ -502,11 +499,14 @@ const createDebuggerSessionViewStore = (options: {
                 } as Partial<DebuggerSessionViewStore>;
               });
             } catch (e) {
-              get().setTracesError(e instanceof Error ? e.message : "Failed to load session blocks");
+              if (!controller.signal.aborted)
+                get().setTracesError(e instanceof Error ? e.message : "Failed to load session blocks");
             } finally {
-              get().setIsTracesLoading(false);
-              // Even on error, so a failed initial fetch can't suppress the pill forever.
-              set({ isInitialTracesLoaded: true } as Partial<DebuggerSessionViewStore>);
+              if (blockRequest === controller) {
+                blockRequest = undefined;
+                get().setIsTracesLoading(false);
+                set({ isInitialTracesLoaded: true } as Partial<DebuggerSessionViewStore>);
+              }
             }
           },
 
@@ -591,86 +591,73 @@ const createDebuggerSessionViewStore = (options: {
             for (const span of spans) get().applyRealtimeSpan(span);
           },
 
-          applyTraceUpdate: (delta) => {
-            const traceId = delta.id;
-            if (!traceId) return;
-            const existingBlock = get().blocks.find((b) => b.type === "trace" && b.traceId === traceId);
-            const rowState = get().traceRowStates[traceId];
-            const hasRow = get().traces.some((row) => row.id === traceId);
-
-            if (hasRow) {
-              get().setTraces((traces) =>
-                traces.map((row) => (row.id === traceId ? mergeTraceDelta(row, delta) : row))
-              );
-              return;
-            }
-
-            // No row yet. Seeding from a delta is only correct when we've seen
-            // every batch for the run — true for a run that is new to this
-            // session, false for a known block whose row was never lazily
-            // loaded (its earlier batches predate us, so seeding would show
-            // wrong-low totals AND mark the row loaded, so ensureTraceRows
-            // never corrects it). Until the blocks index has loaded, an empty
-            // `blocks` can't prove "new" — drop; later deltas seed or merge
-            // once the index lands. Same drop for a known block. Only a
-            // "missing" row (absent from ClickHouse) has no fetch to wait for,
-            // so realtime is its sole source.
-            if ((!get().isInitialTracesLoaded || existingBlock) && rowState !== "missing") return;
-
-            const pendingInput = pendingAgentInputById.get(traceId);
-            pendingAgentInputById.delete(traceId);
-            const seeded = realtimeTraceToRow(delta);
-            get().setTraces((traces) => [
-              ...traces,
-              pendingInput !== undefined ? { ...seeded, agentInput: pendingInput } : seeded,
-            ]);
+          refreshTraceRows: (traceIds) => {
+            if (traceIds.length === 0) return;
             set(
               (s) =>
                 ({
-                  traceRowStates: { ...s.traceRowStates, [traceId]: "loaded" },
-                  realtimeSeededTraceIds: new Set(s.realtimeSeededTraceIds).add(traceId),
-                  ...(!existingBlock
-                    ? {
-                        blocks: sortBlocks([
-                          ...s.blocks,
-                          {
-                            id: `trace:${traceId}`,
-                            type: "trace",
-                            createdAt: delta.startTime ?? new Date().toISOString(),
-                            traceId,
-                          },
-                        ]),
-                      }
-                    : {}),
-                  // Pill only for genuinely new runs, after the initial fetch settles,
-                  // so it can't flash on load. Don't overwrite an existing notice —
-                  // the first unseen block the user hasn't scrolled to wins.
-                  ...(!existingBlock && s.isInitialTracesLoaded && !s.newBlockNotice
-                    ? { newBlockNotice: "trace" as const }
-                    : {}),
+                  traceRowStates: { ...s.traceRowStates, ...Object.fromEntries(traceIds.map((id) => [id, "loading"])) },
                 }) as Partial<DebuggerSessionViewStore>
             );
-            // Spans that raced ahead are already in `traceSpans`; expanding also
-            // fetches any persisted before we subscribed (the delta's real times
-            // give fetchTraceSpans a usable window).
-            get().setTraceExpanded(traceId, true);
+            rowLoader.load(traceIds);
           },
 
-          applyTraceUpdates: (deltas) => {
-            for (const delta of deltas) get().applyTraceUpdate(delta);
-          },
-
-          applyAgentInput: (traceId, agentInput) => {
-            const value = stringifyAgentInput(agentInput);
-            const hasRow = get().traces.some((row) => row.id === traceId);
-            if (hasRow) {
-              get().setTraces((traces) =>
-                traces.map((row) => (row.id === traceId ? { ...row, agentInput: value } : row))
-              );
-            } else {
-              // Row not created yet — buffer; the create branch flushes it.
-              pendingAgentInputById.set(traceId, value);
+          applyTraceUpdates: (notifications) => {
+            const refreshIds = new Set<string>();
+            let addedBlock = false;
+            for (const notification of notifications) {
+              const traceId = notification.id;
+              if (!traceId) continue;
+              const state = get();
+              const existingBlock = state.blocks.some((block) => block.type === "trace" && block.traceId === traceId);
+              if (
+                !existingBlock ||
+                state.traces.some((row) => row.id === traceId) ||
+                state.traceRowStates[traceId] === "loading" ||
+                state.traceRowStates[traceId] === "missing"
+              )
+                refreshIds.add(traceId);
+              if (!existingBlock) {
+                addedBlock = true;
+                set(
+                  (s) =>
+                    ({
+                      blocks: sortBlocks([
+                        ...s.blocks,
+                        {
+                          id: `trace:${traceId}`,
+                          type: "trace",
+                          traceId,
+                          createdAt: notification.startTime ?? new Date().toISOString(),
+                        },
+                      ]),
+                      ...(s.isInitialTracesLoaded && !s.newBlockNotice ? { newBlockNotice: "trace" as const } : {}),
+                    }) as Partial<DebuggerSessionViewStore>
+                );
+                get().setTraceExpanded(traceId, true);
+              }
             }
+            get().refreshTraceRows([...refreshIds]);
+            if (addedBlock) void get().fetchSessionBlocks(options.sessionId);
+          },
+
+          cancelTraceLoads: () => {
+            rowLoader.cancel();
+            blockRequest?.abort();
+            blockRequest = undefined;
+            for (const controller of spanRequests.values()) controller.abort();
+            spanRequests.clear();
+            pendingSpanRefresh.clear();
+            set(
+              (s) =>
+                ({
+                  isTracesLoading: false,
+                  traceSpansFetching: {},
+                  traceRowStates: Object.fromEntries(
+                    Object.entries(s.traceRowStates).filter(([, state]) => state !== "loading")
+                  ),
+                }) as Partial<DebuggerSessionViewStore>
+            );
           },
 
           applyBlockUpdate: (block) => {
@@ -792,6 +779,8 @@ const DebuggerSessionViewStoreProvider = ({
   const [storeState] = useState(() =>
     createDebuggerSessionViewStore({ initialSessionName, initialSessionNameRaw, projectId, sessionId, storeKey })
   );
+
+  useEffect(() => () => storeState.getState().cancelTraceLoads(), [storeState]);
 
   // Provide both the base context (shared session-view children) and the
   // debugger context (debugger chrome + the optional hook).

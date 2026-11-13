@@ -12,7 +12,7 @@ pub struct CostEntry {
 }
 
 /// All token and attribute info extracted from a span, needed for cost calculation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SpanCostInput {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -171,8 +171,13 @@ pub fn calculate_span_cost(model_costs: &ModelCosts, input: &SpanCostInput) -> C
     let base_input_tokens = (input.prompt_tokens - input.audio_input_tokens).max(0);
 
     let input_rate = input_cost_per_token.unwrap_or(0.0);
-    let input_cost =
-        resolve_batch_or_base(costs, "input_cost_per_token_batches", input_rate, tier, input.is_batch);
+    let input_cost = resolve_batch_or_base(
+        costs,
+        "input_cost_per_token_batches",
+        input_rate,
+        tier,
+        input.is_batch,
+    );
     total_input_cost += base_input_tokens as f64 * input_cost;
 
     // Cache read tokens
@@ -217,7 +222,11 @@ pub fn calculate_span_cost(model_costs: &ModelCosts, input: &SpanCostInput) -> C
             .or(input_cost_per_token)
             .unwrap_or(0.0);
         let audio_cost = resolve_batch_or_base(
-            costs, "input_cost_per_audio_token_batches", audio_rate, tier, input.is_batch,
+            costs,
+            "input_cost_per_audio_token_batches",
+            audio_rate,
+            tier,
+            input.is_batch,
         );
         total_input_cost += input.audio_input_tokens as f64 * audio_cost;
     }
@@ -232,7 +241,11 @@ pub fn calculate_span_cost(model_costs: &ModelCosts, input: &SpanCostInput) -> C
 
     let output_rate = output_cost_per_token.unwrap_or(0.0);
     let output_cost = resolve_batch_or_base(
-        costs, "output_cost_per_token_batches", output_rate, tier, input.is_batch,
+        costs,
+        "output_cost_per_token_batches",
+        output_rate,
+        tier,
+        input.is_batch,
     );
     total_output_cost += base_output_tokens as f64 * output_cost;
 
@@ -242,7 +255,11 @@ pub fn calculate_span_cost(model_costs: &ModelCosts, input: &SpanCostInput) -> C
             .or(output_cost_per_token)
             .unwrap_or(0.0);
         let reasoning_cost = resolve_batch_or_base(
-            costs, "output_cost_per_reasoning_token_batches", reasoning_rate, tier, input.is_batch,
+            costs,
+            "output_cost_per_reasoning_token_batches",
+            reasoning_rate,
+            tier,
+            input.is_batch,
         );
         total_output_cost += input.reasoning_tokens as f64 * reasoning_cost;
     }
@@ -253,7 +270,11 @@ pub fn calculate_span_cost(model_costs: &ModelCosts, input: &SpanCostInput) -> C
             .or(output_cost_per_token)
             .unwrap_or(0.0);
         let audio_cost = resolve_batch_or_base(
-            costs, "output_cost_per_audio_token_batches", audio_rate, tier, input.is_batch,
+            costs,
+            "output_cost_per_audio_token_batches",
+            audio_rate,
+            tier,
+            input.is_batch,
         );
         total_output_cost += input.audio_output_tokens as f64 * audio_cost;
     }
