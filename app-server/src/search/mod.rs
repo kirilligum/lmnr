@@ -1,3 +1,4 @@
+pub mod requests;
 pub mod signal_events;
 pub mod snippets;
 
@@ -65,6 +66,7 @@ pub async fn search_spans(
     clickhouse: &clickhouse::Client,
     project_id: Uuid,
     query: &str,
+    search_fields: &[String],
     trace_ids: Option<&[String]>,
     limit: usize,
     offset: usize,
@@ -99,7 +101,11 @@ pub async fn search_spans(
     });
 
     // Set search fields
-    let search_fields = QUICKWIT_SPANS_DEFAULT_SEARCH_FIELDS.join(",");
+    let search_fields = if search_fields.is_empty() {
+        QUICKWIT_SPANS_DEFAULT_SEARCH_FIELDS.join(",")
+    } else {
+        search_fields.join(",")
+    };
     search_body["search_field"] = serde_json::Value::String(search_fields);
 
     // Set pagination

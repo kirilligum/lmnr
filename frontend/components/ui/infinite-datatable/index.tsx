@@ -50,7 +50,7 @@ export function InfiniteDataTable<TData extends RowData>({
   enableRowSelection,
   onRowSelectionChange,
   getRowId,
-  error: _error,
+  error,
   getRowHref,
   getRowClassName,
   loadMoreButton,
@@ -168,20 +168,26 @@ export function InfiniteDataTable<TData extends RowData>({
         />
       )}
       {children && <div className={cn("flex flex-col gap-2 items-start", childrenClassName)}>{children}</div>}
+      {error && (
+        <div role="alert" className="rounded border border-destructive p-3 text-sm text-destructive">
+          <p>Could not load results: {error.message}</p>
+          {data.length > 0 && <p>Previously loaded results remain visible and may be out of date.</p>}
+        </div>
+      )}
       <VirtualizedScroll
         table={table}
         effectiveColumnOrder={effectiveColumnOrder}
         setColumnOrder={setColumnOrder}
         estimatedRowHeight={estimatedRowHeight}
         overscan={overscan}
-        hasMore={hasMore}
+        hasMore={hasMore && !error}
         isFetching={isFetching}
         isLoading={isLoading}
         fetchNextPage={fetchNextPage}
         onRowClick={onRowClick}
         onHoveredRowChange={onHoveredRowChange}
         focusedRowId={focusedRowId}
-        emptyRow={emptyRow}
+        emptyRow={error ? <></> : emptyRow}
         loadingRow={loadingRow}
         getRowHref={getRowHref}
         getRowClassName={getRowClassName}

@@ -4,17 +4,16 @@ import { z } from "zod/v4";
 import { type Filter } from "@/lib/actions/common/filters";
 import { PaginationFiltersSchema, TimeRangeSchema } from "@/lib/actions/common/types";
 import { executeQuery } from "@/lib/actions/sql";
-import { type SpanSearchHit } from "@/lib/actions/traces/search";
-import { searchRequestSpans } from "@/lib/actions/traces/search-requests";
+import { searchSpans, type SpanSearchHit } from "@/lib/actions/traces/search";
+import { searchRequestIds } from "@/lib/actions/traces/search-requests";
 import {
   buildTracesCountQueryWithParams,
   buildTracesQueryWithParams,
   parseCustomColumnsJson,
 } from "@/lib/actions/traces/utils";
 import { clickhouseClient } from "@/lib/clickhouse/client.ts";
+import { type SpanSearchType } from "@/lib/clickhouse/types";
 import { type TraceRow } from "@/lib/traces/types.ts";
-
-import { DEFAULT_SEARCH_MAX_HITS } from "./utils";
 
 export const GetTracesSchema = PaginationFiltersSchema.extend({
   ...TimeRangeSchema.shape,
@@ -57,11 +56,11 @@ export async function getTraces(input: z.infer<typeof GetTracesSchema>): Promise
 
   const filters: Filter[] = compact(inputFilters);
 
-  let limit = pageSize;
-  let offset = Math.max(0, pageNumber * pageSize);
+  const limit = pageSize;
+  const offset = Math.max(0, pageNumber * pageSize);
 
   const customColumns = parseCustomColumnsJson(customColumnsJson);
-  const spanHits = await searchRequestSpans({
+  const traceIds = await searchRequestIds({
     projectId,
     search,
     searchIn,
@@ -72,18 +71,10 @@ export async function getTraces(input: z.infer<typeof GetTracesSchema>): Promise
     traceType,
     filters,
     customColumns,
-    getSnippets: true,
   });
-  const traceIds = [...new Set(spanHits.map((span) => span.trace_id))];
 
-  if (search) {
-    if (traceIds?.length === 0) {
-      return { items: [] };
-    } else {
-      // no pagination for search results, use default limit
-      limit = DEFAULT_SEARCH_MAX_HITS;
-      offset = 0;
-    }
+  if (search?.trim() && traceIds.length === 0) {
+    return { items: [] };
   }
 
   const { query: mainQuery, parameters: mainParams } = buildTracesQueryWithParams({
@@ -105,19 +96,20 @@ export async function getTraces(input: z.infer<typeof GetTracesSchema>): Promise
 
   const items = await executeQuery<TraceRow>({ query: mainQuery, parameters: mainParams, projectId });
 
-  // If we have traceIds from search, sort items to match the search order
-  if (search && traceIds.length > 0) {
-    const traceIdIndexMap = new Map(traceIds.map((id, index) => [id, index]));
-    items.sort((a, b) => {
-      const indexA = traceIdIndexMap.get(a.id) ?? Infinity;
-      const indexB = traceIdIndexMap.get(b.id) ?? Infinity;
-      return indexA - indexB;
+  if (search?.trim() && items.length > 0) {
+    // Snippets decorate the requested page. A span-hit cap cannot determine
+    // which requests exist, their count, or their chart totals.
+    const spanHits = await searchSpans({
+      projectId,
+      traceIds: items.map(({ id }) => id),
+      searchQuery: search,
+      searchType: searchIn as SpanSearchType[],
+      timeRange: { start: new Date(0), end: new Date() },
+      getSnippets: true,
     });
 
     const snippetMap = new Map<string, SpanSearchHit>();
-    const snippetsCountMap = new Map<string, number>();
     for (const hit of spanHits) {
-      snippetsCountMap.set(hit.trace_id, (snippetsCountMap.get(hit.trace_id) ?? 0) + 1);
       if (!snippetMap.has(hit.trace_id) && (hit.input_snippet || hit.output_snippet || hit.attributes_snippet)) {
         snippetMap.set(hit.trace_id, hit);
       }
@@ -129,7 +121,6 @@ export async function getTraces(input: z.infer<typeof GetTracesSchema>): Promise
         item.outputSnippet = hit.output_snippet;
         item.attributesSnippet = hit.attributes_snippet;
       }
-      item.snippetsCount = snippetsCountMap.get(item.id) ?? 0;
     }
   }
 
@@ -156,7 +147,7 @@ export async function countTraces(input: z.infer<typeof GetTracesSchema>): Promi
 
   const customColumns = parseCustomColumnsJson(customColumnsJson);
 
-  const spanHits = await searchRequestSpans({
+  const traceIds = await searchRequestIds({
     projectId,
     search,
     searchIn,
@@ -168,9 +159,8 @@ export async function countTraces(input: z.infer<typeof GetTracesSchema>): Promi
     filters,
     customColumns,
   });
-  const traceIds = [...new Set(spanHits.map((span) => span.trace_id))];
 
-  if (search && traceIds?.length === 0) {
+  if (search?.trim() && traceIds.length === 0) {
     return { count: 0 };
   }
 

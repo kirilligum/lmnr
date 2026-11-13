@@ -120,7 +120,61 @@ pub struct SearchSpansRequest {
     pub offset: usize,
     #[serde(default)]
     pub get_snippets: bool,
+    #[serde(default)]
+    pub search_in: Vec<String>,
     pub actor: Actor,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchRequestsRequest {
+    pub trace_ids: Vec<Uuid>,
+    pub search_query: String,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    #[serde(default)]
+    pub search_in: Vec<String>,
+    pub actor: Actor,
+}
+
+#[post("traces/search")]
+pub async fn search_requests(
+    project_id: web::Path<Uuid>,
+    request: web::Json<SearchRequestsRequest>,
+    quickwit_client: web::Data<Option<QuickwitClient>>,
+) -> ResponseResult {
+    let request = request.into_inner();
+    let _actor = request.actor; // Required server identity, as on spans/search.
+    if request.trace_ids.len() > crate::search::requests::MAX_CANDIDATES
+        || request.start_time > request.end_time
+        || request
+            .search_in
+            .iter()
+            .any(|field| !matches!(field.as_str(), "input" | "output" | "attributes"))
+    {
+        return Ok(HttpResponse::BadRequest()
+            .json(serde_json::json!({"error": "Invalid request search bounds or fields"})));
+    }
+    let Some(client) = quickwit_client.as_ref() else {
+        return Ok(HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "Trace search is unavailable"})));
+    };
+    let fields = if request.search_in.is_empty() {
+        vec!["input".into(), "output".into(), "attributes".into()]
+    } else {
+        request.search_in
+    };
+    let ids = crate::search::requests::search_requests(
+        client,
+        project_id.into_inner(),
+        &request.trace_ids,
+        &request.search_query,
+        &fields,
+        request.start_time,
+        request.end_time,
+    )
+    .await?;
+    Ok(HttpResponse::Ok().json(ids))
 }
 
 #[post("spans/search")]
@@ -151,12 +205,22 @@ pub async fn search_spans(
     if trimmed_query.is_empty() {
         return Ok(HttpResponse::Ok().json(Vec::<SearchSpanHit>::new()));
     }
+    if request
+        .search_in
+        .iter()
+        .any(|field| !matches!(field.as_str(), "input" | "output" | "attributes"))
+    {
+        return Ok(
+            HttpResponse::BadRequest().json(serde_json::json!({"error": "Invalid search fields"}))
+        );
+    }
 
     let quickwit_client = match quickwit_client.as_ref() {
         Some(client) => client,
         None => {
             log::warn!("Quickwit search requested but Quickwit client is not available");
-            return Ok(HttpResponse::Ok().json(Vec::<SearchSpanHit>::new()));
+            return Ok(HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({ "error": "Trace search is unavailable" })));
         }
     };
 
@@ -165,6 +229,7 @@ pub async fn search_spans(
         &clickhouse,
         project_id,
         trimmed_query,
+        &request.search_in,
         request.trace_ids.as_deref(),
         request.limit,
         request.offset,
@@ -175,4 +240,57 @@ pub async fn search_spans(
     .await?;
 
     Ok(HttpResponse::Ok().json(results))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[actix_web::test]
+    async fn request_search_requires_actor_and_reports_unavailability() {
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(web::Data::new(None::<QuickwitClient>))
+                .service(web::scope("/projects/{project_id}").service(search_requests)),
+        )
+        .await;
+        let uri = format!("/projects/{}/traces/search", Uuid::new_v4());
+        let mut body = serde_json::json!({"traceIds": [Uuid::new_v4()], "searchQuery": "human request",
+            "startTime": "1970-01-01T00:00:00Z", "endTime": "2026-01-01T00:00:00Z"});
+        let missing_actor = actix_web::test::TestRequest::post()
+            .uri(&uri)
+            .set_json(&body)
+            .to_request();
+        assert_eq!(
+            actix_web::test::call_service(&app, missing_actor)
+                .await
+                .status(),
+            400
+        );
+        body["actor"] = serde_json::json!({"type": "shared"});
+        let unavailable = actix_web::test::TestRequest::post()
+            .uri(&uri)
+            .set_json(&body)
+            .to_request();
+        assert_eq!(
+            actix_web::test::call_service(&app, unavailable)
+                .await
+                .status(),
+            503
+        );
+        body["traceIds"] = serde_json::json!(vec![
+            Uuid::new_v4();
+            crate::search::requests::MAX_CANDIDATES + 1
+        ]);
+        let oversized = actix_web::test::TestRequest::post()
+            .uri(&uri)
+            .set_json(&body)
+            .to_request();
+        assert_eq!(
+            actix_web::test::call_service(&app, oversized)
+                .await
+                .status(),
+            400
+        );
+    }
 }

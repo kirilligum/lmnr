@@ -5,7 +5,7 @@ import { type Filter } from "@/lib/actions/common/filters";
 import { buildTimeRangeWithFill } from "@/lib/actions/common/query-builder";
 import { executeQuery } from "@/lib/actions/sql";
 import { GetTracesSchema } from "@/lib/actions/traces";
-import { searchRequestSpans } from "@/lib/actions/traces/search-requests";
+import { searchRequestIds } from "@/lib/actions/traces/search-requests";
 import { type TracesStatsDataPoint } from "@/lib/actions/traces/stats-types";
 import {
   buildTracesStatsWhereConditions,
@@ -47,7 +47,7 @@ export async function getTraceStats(
 
   const customColumns = parseCustomColumnsJson(customColumnsJson);
 
-  const spanHits = await searchRequestSpans({
+  const traceIds = await searchRequestIds({
     projectId,
     search,
     searchIn,
@@ -59,9 +59,8 @@ export async function getTraceStats(
     filters,
     customColumns,
   });
-  const traceIds = [...new Set(spanHits.map((span) => span.trace_id))];
 
-  if (search && traceIds?.length === 0) {
+  if (search?.trim() && traceIds.length === 0) {
     const timeRange = getTimeRange(pastHours, startTime, endTime);
     const items = generateEmptyTimeBuckets(timeRange);
     return { items };

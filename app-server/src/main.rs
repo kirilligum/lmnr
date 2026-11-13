@@ -2017,6 +2017,7 @@ fn main() -> anyhow::Result<()> {
                                     .service(routes::sql::sql_to_json)
                                     .service(routes::sql::json_to_sql)
                                     .service(routes::spans::search_spans)
+                                    .service(routes::spans::search_requests)
                                     .service(routes::signal_events::search_signal_events)
                                     .service(routes::rollouts::update_session_name)
                                     .service(routes::static_sp::extract_system_prompt);

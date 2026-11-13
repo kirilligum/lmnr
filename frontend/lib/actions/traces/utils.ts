@@ -269,6 +269,7 @@ export const buildTracesQueryWithParams = (options: BuildTracesQueryOptions): Qu
   } else {
     orderBy.push({ column: traceTimeColumn(options.timeField), direction: sortDirection ?? "DESC" });
   }
+  orderBy.push({ column: "id", direction: "ASC" });
 
   // Build filter config with custom column processors
   const columnFilterConfig = buildFilterConfigWithCustomColumns(customColumns);
@@ -358,6 +359,8 @@ export interface BuildTracesIdsQueryOptions {
   pastHours?: string;
   timeField?: TraceTimeField;
   customColumns?: CustomColumn[];
+  /** null starts an identity-ordered scan; a UUID continues it. */
+  cursor?: string | null;
 }
 
 export const buildTracesIdsQueryWithParams = (options: BuildTracesIdsQueryOptions): QueryResult => {
@@ -380,6 +383,13 @@ export const buildTracesIdsQueryWithParams = (options: BuildTracesIdsQueryOption
     });
   }
 
+  if (options.cursor) {
+    customConditions.push({
+      condition: "id > {cursor:UUID}",
+      params: { cursor: options.cursor },
+    });
+  }
+
   const queryOptions: SelectQueryOptions = {
     select: {
       columns: ["id"],
@@ -395,8 +405,8 @@ export const buildTracesIdsQueryWithParams = (options: BuildTracesIdsQueryOption
     columnFilterConfig: buildFilterConfigWithCustomColumns(options.customColumns),
     orderBy: [
       {
-        column: traceTimeColumn(options.timeField),
-        direction: "DESC",
+        column: options.cursor !== undefined ? "id" : traceTimeColumn(options.timeField),
+        direction: options.cursor !== undefined ? "ASC" : "DESC",
       },
     ],
     customConditions,

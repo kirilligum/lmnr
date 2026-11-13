@@ -66,10 +66,7 @@ export const searchSpans = async ({
     actor: await resolveSqlActor(),
   };
 
-  try {
-    return await callAppServer<SpanSearchHit[]>(`/projects/${projectId}/spans/search`, { method: "POST", body });
-  } catch (error) {
-    console.error("searchSpans error", error);
-    return [];
-  }
+  // The route's normal error handler must distinguish an unavailable search
+  // service from a successful search with no matches.
+  return callAppServer<SpanSearchHit[]>(`/projects/${projectId}/spans/search`, { method: "POST", body });
 };

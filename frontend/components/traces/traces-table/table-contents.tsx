@@ -151,6 +151,7 @@ export const TracesTableContents = memo(function TracesTableContents({
     hasMore,
     isFetching,
     isLoading,
+    error,
     fetchNextPage,
     refetch,
     refresh,
@@ -227,9 +228,10 @@ export const TracesTableContents = memo(function TracesTableContents({
       getRowId={(trace) => trace.id}
       onRowClick={handleRowClick}
       focusedRowId={traceId || searchParams.get("traceId")}
-      hasMore={!textSearchFilter && hasMore}
+      hasMore={hasMore}
       isFetching={isFetching}
       isLoading={isLoading || isViewLoading}
+      error={error}
       fetchNextPage={fetchNextPage}
       getRowHref={getRowHref}
       emptyRow={<TracesEmptyRow hasFilters={filter.length > 0 || !!textSearchFilter} onClearFilters={onClearFilters} />}

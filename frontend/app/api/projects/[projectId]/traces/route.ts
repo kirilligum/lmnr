@@ -19,7 +19,7 @@ export const GET = handlerWithAudit<{ projectId: string }>(
     const parseResult = parseUrlParams(req.nextUrl.searchParams, GetTracesSchema.omit({ projectId: true }));
 
     if (!parseResult.success) {
-      return Response.json({ items: [] });
+      return Response.json({ error: prettifyError(parseResult.error) }, { status: 400 });
     }
 
     const retentionError = await checkDataRetentionAccess(projectId, {

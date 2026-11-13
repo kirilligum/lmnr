@@ -84,8 +84,38 @@ eight-hour-old request, while the same start-time window excludes it.
 
 Last activity means the latest observed span end, not a heartbeat or evidence
 that a quiet operation is still running. Lifecycle display requires explicit
-source state. Candidate-ID materialization and full-history search need load
-qualification; the existing search result cap still applies.
+source state.
+
+Request search scans candidate identities in pages of 256, using an identity
+cursor and a fixed activity window. Each Quickwit query filters the project and
+those candidates, then aggregates distinct trace identities with both bucket
+and split limits equal to the candidate count. It rejects omitted buckets,
+nonzero count-error bounds and failed index splits instead of reporting an
+incomplete search as successful. A request with hundreds of matching spans
+cannot crowd another request out of discovery. Start-time selection also searches
+the selected requests' full retained index history. Search field selection is
+honored by both discovery and snippet requests.
+
+List pagination, counts and charts use matching request identities. Snippets
+only decorate the displayed page; their existing span-hit cap no longer controls
+membership or totals, and a snippet sample is not displayed as a match count.
+Search failures propagate to the normal API error path and the table retains a
+visible error alongside any previously loaded rows. Missing Quickwit returns
+503, not a successful empty result. Invalid trace-list parameters return 400.
+
+The opt-in Quickwit integration test creates a uniquely named test index using
+the real index schema. It reproduces 500 span hits all belonging to one request,
+then verifies that request aggregation also finds a sparse request with input
+nine days old. It checks input/output selection and a same-trace-id collision
+in another project, then deletes the test index. Frontend action tests exercise
+candidate pagination, failure after an earlier successful batch, and list/count/
+chart behavior with 513 matching requests.
+
+This bounds candidate query size, not total work or the final matching-ID set.
+Broad searches still need production load qualification. Pagination is an
+eventually consistent read of retained data, not a cross-store snapshot; concurrent
+ingestion can change membership and requires refresh. Search retention remains
+the existing index's retention policy.
 
 ## Canonical reads and partial writes
 

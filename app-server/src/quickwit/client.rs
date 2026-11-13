@@ -193,6 +193,17 @@ impl QuickwitClient {
         }
 
         let result = response.json::<serde_json::Value>().await?;
+        // Quickwit can answer HTTP 200 with only the successful splits. A
+        // partial search must not be reported as complete request discovery.
+        if result
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            return Err(anyhow!(
+                "Search is incomplete because some index splits failed"
+            ));
+        }
         Ok(result)
     }
 
@@ -227,6 +238,40 @@ async fn connect_channel(endpoint: &str) -> anyhow::Result<Channel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn search_rejects_http_success_with_failed_splits() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for errors in [
+            serde_json::json!([]),
+            serde_json::json!(["split unavailable"]),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let response_body = serde_json::json!({"errors": errors, "hits": []}).to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 4096];
+                socket.read(&mut buffer).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let client = QuickwitClient::connect_lazy(QuickwitConfig {
+                ingest_endpoint: "http://127.0.0.1:1".into(),
+                search_endpoint: format!("http://{address}"),
+                force_commit: false,
+            })
+            .unwrap();
+            let result = client
+                .search_index("test-index", serde_json::json!({"query": "test"}))
+                .await;
+            assert_eq!(result.is_ok(), errors.as_array().unwrap().is_empty());
+            server.await.unwrap();
+        }
+    }
 
     /// The stream indexer reader is gated only on a config flag, so it must be
     /// constructible while Quickwit is down — otherwise producer pods publish
