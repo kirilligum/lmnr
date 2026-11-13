@@ -236,6 +236,53 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
             ensure!(count == 1, "project deletion failed to cascade");
+
+            // Bounded ingestion/replay probe using the production batch APIs.
+            // Emit measurements instead of a hardware-dependent timing gate.
+            let proposals: Vec<_> = (0..10_000).map(|n| AccountingReceipt {
+                identity: AccountingIdentity {
+                    project_id: Uuid::from_u128(9),
+                    trace_id: Uuid::from_u128(100 + n / 100),
+                    span_id: Uuid::from_u128(100 + n),
+                },
+                fingerprint: vec![(n % 256) as u8; 32],
+                conflict_detected: false,
+                usage: SpanUsage {
+                    input_tokens: 11, output_tokens: 2, total_tokens: 13,
+                    input_cost: 0.25, output_cost: 0.125, total_cost: 0.375,
+                    pricing_basis: serde_json::json!({
+                        "source": "synthetic rate card",
+                        "input_cost_per_token": 0.25 / 11.0,
+                        "output_cost_per_token": 0.125 / 2.0,
+                        "cache_read_input_token_cost": 0.001,
+                        "cache_creation_input_token_cost": 0.002,
+                    }),
+                    ..Default::default()
+                },
+            }).collect();
+            let started = std::time::Instant::now();
+            let accepted = accept_receipts(&pool, &proposals).await?;
+            let insert_ms = started.elapsed().as_millis();
+            ensure!(accepted.len() == proposals.len(), "bounded receipt batch lost identities");
+            let mut identities: Vec<_> = proposals.iter().map(|r| r.identity).collect();
+            identities.reverse();
+            let expected: std::collections::BTreeMap<_, _> = proposals.iter().map(|r| (r.identity, r)).collect();
+            let started = std::time::Instant::now();
+            for chunk in identities.chunks(333) {
+                let loaded = get_receipts(&pool, chunk).await?;
+                ensure!(loaded.len() == chunk.len(), "rebatched receipt lookup lost identities");
+                for receipt in loaded {
+                    let original = expected[&receipt.identity];
+                    ensure!(receipt.usage == original.usage && receipt.fingerprint == original.fingerprint, "rebatched receipt lookup changed an accepted fact");
+                }
+            }
+            let read_ms = started.elapsed().as_millis();
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM span_accounting_receipts")
+                .fetch_one(&pool).await?;
+            ensure!(count == 10_001, "bounded receipt lookup changed cardinality");
+            let storage_bytes: i64 = sqlx::query_scalar("SELECT pg_total_relation_size('span_accounting_receipts'::regclass)")
+                .fetch_one(&pool).await?;
+            println!("{}", serde_json::json!({"receipt_probe": {"identities": 10000, "insert_ms": insert_ms, "rebatched_read_ms": read_ms, "table_and_index_bytes": storage_bytes, "full_pipeline_capacity_qualified": false}}));
             pool.close().await;
             Ok(())
         }

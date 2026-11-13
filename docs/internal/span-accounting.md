@@ -100,6 +100,31 @@ The receipt rejects a changed source body or lifecycle before analytical writes,
 so rows accepted under one identity have the same source content. Backend
 masking and dedup markers remain separate projections of that source.
 
+Metadata-only queue deliveries preserve the virtual span identity in the map,
+so retrying a patch adds neither a second span count nor model usage. Their
+zero end time cannot advance observed activity. The RowBinary integration
+replays both aggregate and static patch rows in a different partition from the
+request, then reads both native trace views. It checks unchanged input, usage,
+activity and raw existence/start-time readers. Separate metadata API calls still
+create separate virtual operations; this does not make that API idempotent.
+
+The database byte-usage reader sums canonical span rows. Its integration case
+uses the real billing-window query with a smaller retry row, another project
+and an earlier billing period, before and after physical merges. This verifies
+the stored read model only. The existing cloud usage-limit cache still adds
+bytes per delivery, and non-recordable spans have no stored body to reconstruct
+their bytes. Do not claim replay-safe cloud quota enforcement from this change.
+The processing path is gated by `Feature::UsageLimit`; deployment qualification
+must check that feature separately.
+
+The raw `traces_agg` readers outside native views use existence, minimum start
+time, historical-backfill membership, signal/cluster identity sets, or physical
+table telemetry. The telemetry counter explicitly measures physical rows, not
+logical traces. Historical backfill still writes legacy additive counters and
+must finish before a cutover is qualified. Signal execution is compiled out of
+the default OSS Docker build; a signals-enabled build needs its own replay
+qualification and is not covered by the default-image checks.
+
 The processor awaits both trace and span persistence branches. Either failure
 returns a transient handler error, allowing the existing queue worker to retry.
 Trace realtime notifications follow successful persistence. A recording-sink
@@ -154,8 +179,9 @@ Debugger-store tests cover the actual row loading and new-run/span flow.
   candidate backend. Source tests do not establish installed UI acceptance.
 - Verify the deployed queue/restart boundary and partial-write repair with both
   existing producers after all other replay gates pass.
-- Check raw `traces_agg` consumers, span counts, signals, metadata-only writes,
-  rollback, and the existing consumer queue/checkpoint boundary.
+- Verify that the deployed build's raw readers and feature gates match the
+  audited paths above. Rollback and the existing consumer queue/checkpoint
+  boundary still require operational evidence.
 - Qualify the actual RowBinary writer, migration views, reordered/rebatched
   replay, mixed projects, non-recordable usage, long requests and late fields.
 
@@ -187,5 +213,10 @@ is an opt-in integration test using `DATABASE_URL`. It creates a unique
 temporary schema, a minimal synthetic `projects` table and migration 0129.
 Eight concurrent workers propose different prices for the same source fact;
 all must receive one accepted snapshot. It also checks replay, durable conflict
-flags, scoped identities and project-deletion cascade, then drops that schema.
-It does not run the application migrator or modify application tables.
+flags, scoped identities and project-deletion cascade. A bounded probe then
+inserts 10,000 synthetic receipts through the production batch API and reads
+them in reversed order and different batch sizes, checking every accepted fact
+and total cardinality. It reports insert/read time and table-plus-index bytes;
+there is no hardware-dependent timing assertion. The schema is dropped after
+the probe. It does not run the application migrator, modify application tables,
+or establish full ingestion-pipeline capacity.

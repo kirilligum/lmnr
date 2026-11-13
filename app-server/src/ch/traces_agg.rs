@@ -346,6 +346,7 @@ mod tests {
             isolated.query("CREATE TABLE traces_static AS default.traces_static").execute().await?;
             isolated.query("CREATE TABLE trace_tags AS default.trace_tags").execute().await?;
             isolated.query("CREATE TABLE spans AS default.spans").execute().await?;
+            isolated.query("CREATE TABLE browser_session_events AS default.browser_session_events").execute().await?;
             isolated.query("CREATE TABLE evaluation_datapoints AS default.evaluation_datapoints").execute().await?;
             let migration = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../frontend/lib/clickhouse/migrations/84_span_accounting.sql"))?;
             let migration = migration.replace("default.", &format!("{database}."))
@@ -426,6 +427,39 @@ mod tests {
                 }
             }
 
+            // Metadata-only deliveries keep their virtual identity but never
+            // add model usage or move the request's last observed activity.
+            // A patch can arrive in a different partition from the request.
+            let patch = TraceMetadataPatch {
+                span_id: Uuid::new_v4(), project_id: row.project_id, trace_id: row.id,
+                metadata: json!({"review_note": "synthetic metadata"}),
+            };
+            let patch_time = chrono_to_nanoseconds(chrono::Utc::now()) + PATCH_START_TIME_OFFSET_NS;
+            let patch_row = CHTraceAgg::from_metadata_patch(&patch, patch_time);
+            let patch_static = crate::ch::traces_static::CHTraceStatic::from_metadata_patch(
+                row.project_id, row.id, Some(&patch.metadata), patch_time,
+            ).unwrap();
+            for _ in 0..2 {
+                crate::ch::ClickhouseTrait::insert_batch(&writer, std::slice::from_ref(&patch_row), None).await?;
+                crate::ch::ClickhouseTrait::insert_batch(&writer, std::slice::from_ref(&patch_static), None).await?;
+            }
+            let totals = isolated.query("SELECT sum(total_tokens) + arraySum(value -> value.3, mapValues(maxMap(span_accounting))) AS tokens, sum(num_spans) + length(mapKeys(maxMap(span_accounting))) AS spans, sum(total_cost) + arraySum(value -> value.9, mapValues(maxMap(span_accounting))) AS cost FROM traces_agg").fetch_one::<Totals>().await?;
+            anyhow::ensure!(totals.tokens == 18 && totals.spans == 4 && totals.cost == 0.5, "metadata replay changed usage or counted the virtual span twice");
+            anyhow::ensure!(trace_exists(&isolated, row.project_id, row.id).await?, "raw existence reader lost the request");
+            anyhow::ensure!(!trace_exists(&isolated, Uuid::new_v4(), row.id).await?, "raw existence reader crossed projects");
+            let starts = trace_start_times(&isolated, row.project_id, &[row.id]).await?;
+            anyhow::ensure!(starts.get(&row.id) == Some(&row.start_time), "metadata patch moved the raw start-time reader");
+            #[derive(Row, Deserialize)]
+            struct PatchedTrace { input: String, note: String, end: i64 }
+            for view in ["traces_v0", "traces_v1"] {
+                let policy = if view == "traces_v1" { ", policy='{}'" } else { "" };
+                let sql = format!("SELECT agent_input AS input, JSONExtractString(metadata, 'review_note') AS note, toUnixTimestamp64Nano(end_time) AS end FROM {view}(project_id=?, min_start_time=fromUnixTimestamp64Nano(?), max_start_time=fromUnixTimestamp64Nano(?){policy}) WHERE id=?");
+                let patched = isolated.query(&sql).bind(row.project_id)
+                    .bind(row.start_time - 1_000_000_000).bind(later.end_time + 1_000_000_000)
+                    .bind(row.id).fetch_one::<PatchedTrace>().await?;
+                anyhow::ensure!(patched.input == "synthetic human input" && patched.note == "synthetic metadata" && patched.end == later.end_time, "{view} lost cross-partition metadata/input or advanced activity on replay");
+            }
+
             // Delivery duplicates can carry different content-dedup markers.
             // Canonicalization must precede SUM and preserve the first content
             // occurrence, both before and after physical merges.
@@ -456,6 +490,33 @@ mod tests {
             let masked = isolated.query("SELECT input FROM spans_v1(project_id=?,policy='{\"maskPii\":true}') WHERE trace_id=?")
                 .bind(row.project_id).bind(row.id).fetch_one::<String>().await?;
             anyhow::ensure!(masked == "\"[PII_MASKED_UNAVAILABLE]\"", "canonicalization exposed unchecked content");
+
+            // Exercise the actual usage-limit reader, including its billing
+            // window and project filter. Retry dedup markers must not replace
+            // the original operation's byte charge with a smaller retry row.
+            let byte_trace = Uuid::new_v4();
+            let byte_span = Uuid::new_v4();
+            let now = chrono::Utc::now();
+            let byte_time = chrono_to_nanoseconds(now);
+            let byte_insert = "INSERT INTO spans (project_id, trace_id, span_id, name, start_time, end_time, size_bytes, input_new_message_indices) VALUES (?, ?, ?, 'synthetic byte accounting', fromUnixTimestamp64Nano(?), fromUnixTimestamp64Nano(?), ?, ?)";
+            for (project, bytes, indices) in [
+                (row.project_id, 250_u64, vec![0_u32]),
+                (Uuid::new_v4(), 999_u64, vec![0_u32]),
+            ] {
+                isolated.query(byte_insert).bind(project).bind(byte_trace).bind(byte_span)
+                    .bind(byte_time).bind(byte_time).bind(bytes).bind(indices).execute().await?;
+            }
+            for merged in [false, true] {
+                if merged {
+                    isolated.query("OPTIMIZE TABLE spans FINAL").execute().await?;
+                }
+                isolated.query(byte_insert).bind(row.project_id).bind(byte_trace).bind(byte_span)
+                    .bind(byte_time).bind(byte_time).bind(100_u64).bind(Vec::<u32>::new()).execute().await?;
+                let bytes = crate::ch::limits::get_workspace_bytes_ingested_by_project_ids(
+                    isolated.clone(), vec![row.project_id], now - chrono::Duration::hours(1),
+                ).await?;
+                anyhow::ensure!(bytes == 250, "usage-limit reader counted replay, foreign-project or old-period bytes: {bytes}");
+            }
             Ok(())
         }.await;
         client
