@@ -1,17 +1,70 @@
 -- Delivery attempts remain in the physical append-only table. Every logical
--- span reader deduplicates by the scoped operation identity before filtering
--- or aggregating. Selecting the whole row keeps content and PII masks paired.
+-- span reader deduplicates by the scoped operation identity before content
+-- filtering or aggregation. Identity predicates can prune the underlying scan.
 -- Prefer screened rows and the original trace-new content markers: a producer
 -- retry can have empty new-message indices after its first delivery was seen.
+-- All argMax calls share a unique rank within this single MergeTree snapshot,
+-- so every field comes from the same row, including tied content/PII variants.
+-- The physical address only breaks preference ties: it is not persisted or used
+-- as an operation identity. Wrapping values retains NULLs instead of skipping
+-- to another row. Separate aggregates let narrow readers omit large payloads.
 CREATE VIEW IF NOT EXISTS spans_canonical SQL SECURITY INVOKER AS
-SELECT *
-FROM default.spans
-QUALIFY row_number() OVER (
-    PARTITION BY project_id, trace_id, span_id
-    ORDER BY pii_checked DESC,
-        length(input_new_message_indices) + length(output_new_message_indices) DESC,
-        end_time DESC
-) = 1;
+SELECT
+    s.span_id AS span_id,
+    argMax(tuple(s.name), s.canonical_rank).1 AS name,
+    argMax(tuple(s.span_type), s.canonical_rank).1 AS span_type,
+    argMax(tuple(s.start_time), s.canonical_rank).1 AS start_time,
+    argMax(tuple(s.end_time), s.canonical_rank).1 AS end_time,
+    argMax(tuple(s.input_cost), s.canonical_rank).1 AS input_cost,
+    argMax(tuple(s.output_cost), s.canonical_rank).1 AS output_cost,
+    argMax(tuple(s.total_cost), s.canonical_rank).1 AS total_cost,
+    argMax(tuple(s.model), s.canonical_rank).1 AS model,
+    argMax(tuple(s.session_id), s.canonical_rank).1 AS session_id,
+    s.project_id AS project_id,
+    s.trace_id AS trace_id,
+    argMax(tuple(s.provider), s.canonical_rank).1 AS provider,
+    argMax(tuple(s.input_tokens), s.canonical_rank).1 AS input_tokens,
+    argMax(tuple(s.output_tokens), s.canonical_rank).1 AS output_tokens,
+    argMax(tuple(s.total_tokens), s.canonical_rank).1 AS total_tokens,
+    argMax(tuple(s.user_id), s.canonical_rank).1 AS user_id,
+    argMax(tuple(s.path), s.canonical_rank).1 AS path,
+    argMax(tuple(s.input), s.canonical_rank).1 AS input,
+    argMax(tuple(s.output), s.canonical_rank).1 AS output,
+    argMax(tuple(s.size_bytes), s.canonical_rank).1 AS size_bytes,
+    argMax(tuple(s.status), s.canonical_rank).1 AS status,
+    argMax(tuple(s.attributes), s.canonical_rank).1 AS attributes,
+    argMax(tuple(s.request_model), s.canonical_rank).1 AS request_model,
+    argMax(tuple(s.response_model), s.canonical_rank).1 AS response_model,
+    argMax(tuple(s.parent_span_id), s.canonical_rank).1 AS parent_span_id,
+    argMax(tuple(s.trace_metadata), s.canonical_rank).1 AS trace_metadata,
+    argMax(tuple(s.trace_type), s.canonical_rank).1 AS trace_type,
+    argMax(tuple(s.tags_array), s.canonical_rank).1 AS tags_array,
+    argMax(tuple(s.events), s.canonical_rank).1 AS events,
+    argMax(tuple(s.input_message_hashes), s.canonical_rank).1 AS input_message_hashes,
+    argMax(tuple(s.span_kind), s.canonical_rank).1 AS span_kind,
+    argMax(tuple(s.input_new_message_indices), s.canonical_rank).1 AS input_new_message_indices,
+    argMax(tuple(s.output_message_hashes), s.canonical_rank).1 AS output_message_hashes,
+    argMax(tuple(s.output_new_message_indices), s.canonical_rank).1 AS output_new_message_indices,
+    argMax(tuple(s.tool_definitions_hash), s.canonical_rank).1 AS tool_definitions_hash,
+    argMax(tuple(s.cache_read_input_tokens), s.canonical_rank).1 AS cache_read_input_tokens,
+    argMax(tuple(s.cache_creation_input_tokens), s.canonical_rank).1 AS cache_creation_input_tokens,
+    argMax(tuple(s.reasoning_tokens), s.canonical_rank).1 AS reasoning_tokens,
+    argMax(tuple(s.input_masks), s.canonical_rank).1 AS input_masks,
+    argMax(tuple(s.output_masks), s.canonical_rank).1 AS output_masks,
+    argMax(tuple(s.pii_checked), s.canonical_rank).1 AS pii_checked,
+    argMax(tuple(s.original_size_bytes), s.canonical_rank).1 AS original_size_bytes,
+    argMax(tuple(s.created_at), s.canonical_rank).1 AS created_at
+FROM (
+    SELECT *, tuple(
+        pii_checked,
+        length(input_new_message_indices) + length(output_new_message_indices),
+        end_time,
+        _part,
+        _part_offset
+    ) AS canonical_rank
+    FROM default.spans
+) AS s
+GROUP BY s.project_id, s.trace_id, s.span_id;
 
 DROP VIEW IF EXISTS spans_v0;
 CREATE VIEW IF NOT EXISTS spans_v0 SQL SECURITY INVOKER AS

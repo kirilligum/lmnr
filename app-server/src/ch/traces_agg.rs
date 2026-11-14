@@ -491,6 +491,53 @@ mod tests {
                 .bind(row.project_id).bind(row.id).fetch_one::<String>().await?;
             anyhow::ensure!(masked == "\"[PII_MASKED_UNAVAILABLE]\"", "canonicalization exposed unchecked content");
 
+            // Preserve SELECT * compatibility, including field order and types.
+            let schema_sql = "SELECT toJSONString(groupArray((name, type))) FROM (SELECT name, type FROM system.columns WHERE database=currentDatabase() AND table=? ORDER BY position)";
+            let physical_schema = isolated.query(schema_sql).bind("spans").fetch_one::<String>().await?;
+            let canonical_schema = isolated.query(schema_sql).bind("spans_canonical").fetch_one::<String>().await?;
+            anyhow::ensure!(physical_schema == canonical_schema, "canonical span schema differs from the physical row schema");
+
+            // Equal preference ranks must still select a complete physical row.
+            // These adversarial legacy variants deliberately disagree on body,
+            // masks and bytes. New finalized-source conflicts are rejected by
+            // receipts, but canonical reads must never synthesize a hybrid row.
+            let tied_trace = Uuid::new_v4();
+            let tied_span = Uuid::new_v4();
+            let tied_insert = "INSERT INTO spans (project_id,trace_id,span_id,start_time,end_time,input,output,input_masks,output_masks,pii_checked,size_bytes) VALUES (?,?,?,fromUnixTimestamp64Nano(?),fromUnixTimestamp64Nano(?),?,?,[(1,?, 'synthetic')],[(1,?, 'synthetic')],true,?)";
+            let tied_columns = "toJSONString(tuple(input,output,input_masks,output_masks,size_bytes))";
+            for (input, output, mask_end, bytes) in [
+                ("\"abc\"", "\"def\"", 2_u32, 21_u64),
+                ("\"uvwxyz\"", "\"ghijkl\"", 4_u32, 42_u64),
+            ] {
+                isolated.query(tied_insert).bind(row.project_id).bind(tied_trace).bind(tied_span)
+                    .bind(row.start_time).bind(row.end_time).bind(input).bind(output)
+                    .bind(mask_end).bind(mask_end).bind(bytes).execute().await?;
+            }
+            for merged in [false, true] {
+                if merged {
+                    isolated.query("OPTIMIZE TABLE spans FINAL").execute().await?;
+                }
+                let originals = isolated.query(&format!("SELECT {tied_columns} FROM spans WHERE project_id=? AND trace_id=?"))
+                    .bind(row.project_id).bind(tied_trace).fetch_all::<String>().await?;
+                let selected = isolated.query(&format!("SELECT {tied_columns} FROM spans_canonical WHERE project_id=? AND trace_id=?"))
+                    .bind(row.project_id).bind(tied_trace).fetch_all::<String>().await?;
+                anyhow::ensure!(selected.len() == 1 && originals.contains(&selected[0]), "canonicalization mixed tied physical rows");
+                let omitted = originals.iter().find(|value| **value != selected[0]).unwrap();
+                let count = isolated.query(&format!("SELECT count() FROM spans_canonical WHERE project_id=? AND trace_id=? AND {tied_columns}=?"))
+                    .bind(row.project_id).bind(tied_trace).bind(omitted).fetch_one::<u64>().await?;
+                anyhow::ensure!(count == 0, "content filter selected a noncanonical delivery");
+            }
+
+            // The former global window blocked identity predicate pushdown.
+            // Exercise the native policy-aware view, as used by trace detail.
+            let plan = isolated.query("EXPLAIN indexes=1 SELECT input,output FROM spans_v1(project_id=?,policy='{}') WHERE trace_id=?")
+                .bind(row.project_id).bind(row.id).fetch_all::<String>().await?;
+            anyhow::ensure!(plan.iter().any(|line| line.contains("Condition:") && line.contains("project_id") && line.contains("trace_id")), "native trace detail lost primary-key pruning: {plan:?}");
+            let narrow_plan = isolated.query("EXPLAIN actions=1 SELECT sum(size_bytes),sum(total_tokens) FROM spans_canonical WHERE project_id=?")
+                .bind(row.project_id).fetch_all::<String>().await?;
+            anyhow::ensure!(narrow_plan.iter().any(|line| line.contains("INPUT") && line.contains("size_bytes UInt64")), "missing aggregate read plan: {narrow_plan:?}");
+            anyhow::ensure!(!narrow_plan.iter().any(|line| line.contains("INPUT") && ["input String", "output String", "attributes String"].iter().any(|column| line.contains(column))), "narrow aggregate reads large payloads: {narrow_plan:?}");
+
             // Exercise the actual usage-limit reader, including its billing
             // window and project filter. Retry dedup markers must not replace
             // the original operation's byte charge with a smaller retry row.

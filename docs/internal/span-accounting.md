@@ -130,6 +130,24 @@ The receipt rejects a changed source body or lifecycle before analytical writes,
 so rows accepted under one identity have the same source content. Backend
 masking and dedup markers remain separate projections of that source.
 
+The canonical view groups by the three identity columns and uses a shared
+`argMax` rank for each returned field. The rank ends with `(_part, _part_offset)`,
+which uniquely identifies a physical row within the single MergeTree read.
+This prevents tied preferences from mixing content and masks across rows.
+Physical addresses are neither persisted nor used as operation identities:
+merges can change the address and which equivalent tied delivery wins. Tuple
+wrappers preserve null values without selecting another delivery. The view
+preserves the physical table's column order and types.
+
+Grouping permits project/trace predicates to prune the scan, while separate
+field aggregates allow token/byte readers to omit payload columns. The previous
+window-based candidate scanned all projects before applying a trace filter and
+exceeded 512 MiB for a 115-span detail read on retained production data. A single
+whole-row `argMax` fixed that pruning but forced narrow project aggregates to
+read large payloads and also exceeded the limit. Neither is an acceptable
+substitute for validating both detail and aggregate query plans. Content and
+other non-identity predicates must still apply after canonical selection.
+
 Metadata-only queue deliveries preserve the virtual span identity in the map,
 so retrying a patch adds neither a second span count nor model usage. Their
 zero end time cannot advance observed activity. The RowBinary integration
@@ -225,7 +243,11 @@ the existing table schemas, applies migrations 84 and 85, and verifies a replaye
 real Rust insert plus both native trace views with eight-hour continuations and
 late static fields. It also verifies canonical native span counts before and
 after merges, tenant isolation, original content markers and fail-closed PII
-masking. It never writes existing application tables.
+masking. Tied legacy variants must select one complete physical row, including
+content and masks, before and after merges. It verifies column order/types,
+primary-key pruning through the native span view, and omission of payload
+columns from token/byte aggregate reads. It never writes existing application
+tables.
 
 `traces::accounting` tests accepted pricing across changed/missing rates, lost
 receipt acknowledgements, retryable pricing failures, explicit zero versus
